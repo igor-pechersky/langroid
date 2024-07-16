@@ -63,6 +63,7 @@ def is_valid_uuid(uuid_to_test: str) -> bool:
 
 class QdrantDBConfig(VectorStoreConfig):
     cloud: bool = True
+    docker: bool = False
     collection_name: str | None = "temp"
     storage_path: str = ".qdrant/data"
     embedding: EmbeddingModelsConfig = OpenAIEmbeddingsConfig()
@@ -102,7 +103,19 @@ class QdrantDB(VectorStore):
         load_dotenv()
         key = os.getenv("QDRANT_API_KEY")
         url = os.getenv("QDRANT_API_URL")
-        if config.cloud and None in [key, url]:
+        if config.docker:
+            if url is None:
+                logger.warning(
+                    f"""The QDRANT_API_URL env variable must be set to use
+                    QdrantDB in local docker mode. Please set this
+                    value in your .env file.
+                    Switching to local storage at {config.storage_path}
+                    """
+                )
+                config.cloud = False
+            else:
+                config.cloud = True
+        elif config.cloud and None in [key, url]:
             logger.warning(
                 f"""QDRANT_API_KEY, QDRANT_API_URL env variable must be set to use 
                 QdrantDB in cloud mode. Please set these values 
@@ -111,6 +124,7 @@ class QdrantDB(VectorStore):
                 """
             )
             config.cloud = False
+
         if config.cloud:
             self.client = QdrantClient(
                 url=url,
@@ -366,7 +380,11 @@ class QdrantDB(VectorStore):
                 with_payload=True,
                 with_vectors=False,
             )
-            docs += [Document(**record.payload) for record in results]  # type: ignore
+            docs += [
+                self.config.document_class(**record.payload)  # type: ignore
+                for record in results
+            ]
+            # ignore
             if next_page_offset is None:
                 break
             offset = next_page_offset  # type: ignore
@@ -385,7 +403,7 @@ class QdrantDB(VectorStore):
         # Note the records may NOT be in the order of the ids,
         # so we re-order them here.
         id2payload = {record.id: record.payload for record in records}
-        ordered_payloads = [id2payload[id] for id in _ids]
+        ordered_payloads = [id2payload[id] for id in _ids if id in id2payload]
         docs = [Document(**payload) for payload in ordered_payloads]  # type: ignore
         return docs
 
@@ -437,7 +455,7 @@ class QdrantDB(VectorStore):
         ]  # 2D list -> 1D list
         scores = [match.score for match in search_result if match is not None]
         docs = [
-            Document(**(match.payload))  # type: ignore
+            self.config.document_class(**(match.payload))  # type: ignore
             for match in search_result
             if match is not None
         ]
