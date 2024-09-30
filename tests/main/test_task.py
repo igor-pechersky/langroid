@@ -10,8 +10,15 @@ import pytest
 import langroid as lr
 from langroid.agent import ChatDocument
 from langroid.agent.chat_agent import ChatAgent, ChatAgentConfig
-from langroid.agent.task import Task
+from langroid.agent.task import Task, TaskConfig
 from langroid.agent.tool_message import ToolMessage
+from langroid.agent.tools.orchestration import (
+    AgentDoneTool,
+    DonePassTool,
+    DoneTool,
+    PassTool,
+)
+from langroid.language_models.mock_lm import MockLMConfig
 from langroid.mytypes import Entity
 from langroid.utils.configuration import (
     Settings,
@@ -51,6 +58,32 @@ def test_task_cost(test_settings: Settings):
         lr.StatusCode.MAX_COST,
         lr.StatusCode.MAX_TOKENS,
     ]
+
+
+@pytest.mark.parametrize("restart", [True, False])
+def test_task_restart(test_settings: Settings, restart: bool):
+    """Test whether the `restart` option works as expected"""
+    set_global(test_settings)
+    agent = ChatAgent(
+        ChatAgentConfig(
+            name="Test",
+            llm=MockLMConfig(response_fn=lambda x: int(x) + 1),  # increment
+        ),
+    )
+    task = Task(
+        agent,
+        interactive=False,
+        single_round=False,
+        restart=restart,
+    )
+    task.run("4", turns=1)  # msg hist = sys, user=4, asst=5
+    # if restart, erases agent history => msg hist = sys, user=10, asst=11
+    # otherwise, adds to msg history => msg hist = sys, user=4, asst=5, user=10, asst=11
+    task.run("10", turns=1)
+    if restart:
+        assert len(agent.message_history) == 3
+    else:
+        assert len(agent.message_history) == 5
 
 
 @pytest.mark.asyncio
@@ -221,14 +254,18 @@ def test_task_default_human_response(
 
 
 @pytest.mark.parametrize("use_fn_api", [True, False])
+@pytest.mark.parametrize("use_tools_api", [True, False])
+@pytest.mark.parametrize("use_orch_tools", [True, False])
 @pytest.mark.parametrize(
-    "agent_response",
-    [f"{DONE} {PASS}", DONE],
+    "agent_done_pass",
+    [True, False],
 )
 def test_task_tool_agent_response(
     test_settings: Settings,
     use_fn_api: bool,
-    agent_response: str,
+    use_tools_api: bool,
+    agent_done_pass: bool,
+    use_orch_tools: bool,
 ):
     """
     Test loop within single agent, where this cycle repeats:
@@ -246,8 +283,11 @@ def test_task_tool_agent_response(
         number: int
         successor: int
 
-        def handle(self) -> str:
-            return agent_response
+        def handle(self) -> str | ToolMessage:
+            if use_orch_tools:
+                return DonePassTool() if agent_done_pass else DoneTool()
+            else:
+                return DONE + " " + PASS if agent_done_pass else DONE
 
         @classmethod
         def examples(cls) -> List["ToolMessage"]:
@@ -273,6 +313,7 @@ def test_task_tool_agent_response(
         ChatAgentConfig(
             name="Test",
             use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
             use_tools=not use_fn_api,
             system_message="""
             User will send a number. Present this number and its successor,
@@ -289,7 +330,7 @@ def test_task_tool_agent_response(
         return response.content == ""
 
     def fn_call_valid():
-        return response.function_call.name == "next_num"
+        return isinstance(agent.get_tool_messages(response)[0], AugmentTool)
 
     def tool_valid():
         return "next_num" in response.content
@@ -297,19 +338,24 @@ def test_task_tool_agent_response(
     def fn_or_tool_valid():
         return fn_call_valid() if use_fn_api else tool_valid()
 
-    match agent_response:
-        case x if x == DONE:
-            assert content_empty()
-        case x if x == f"{DONE} {PASS}":
-            assert fn_or_tool_valid()
+    if agent_done_pass:
+        assert fn_or_tool_valid()
+    else:
+        assert content_empty()
 
 
-@pytest.mark.parametrize("use_fn_api", [True, False])
-@pytest.mark.parametrize("agent_response", ["{successor}", f"{DONE} {{successor}}"])
+@pytest.mark.parametrize("use_fn_api", [False, True])
+@pytest.mark.parametrize("use_tools_api", [True, False])
+@pytest.mark.parametrize("agent_response_done", [False, True])
+@pytest.mark.parametrize("use_orch_tools", [False, True])
+@pytest.mark.parametrize("string_signals", [False, True])
 def test_task_tool_num(
     test_settings: Settings,
     use_fn_api: bool,
-    agent_response: str,
+    use_tools_api: bool,
+    agent_response_done: bool,
+    use_orch_tools: bool,
+    string_signals: bool,
 ):
     """
     Test loop within single agent, where this cycle repeats:
@@ -327,40 +373,69 @@ def test_task_tool_num(
         number: int
         successor: int
 
-        def handle(self) -> str:
-            return agent_response.format(
-                number=self.number,
-                successor=self.successor,
-            )
+        def handle(self) -> str | DoneTool:
+            if agent_response_done:
+                if use_orch_tools:
+                    return DoneTool(content=str(self.successor))
+                else:
+                    return DONE + " " + str(self.successor)
+            else:
+                return str(self.successor)
+
+    tool_name = AugmentTool.default_value("request")
+    done_pass_tool_name = DonePassTool.default_value("request")
+    if use_orch_tools:
+        done_response = f"use the TOOL: `{done_pass_tool_name}`"
+    else:
+        done_response = f"say {DONE} {PASS}"
 
     agent = ChatAgent(
         ChatAgentConfig(
             name="Test",
             use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
             use_tools=not use_fn_api,
             system_message=f"""
             User will send a number. Augment it with its successor,
-            and present the numbers using the `number` tool/function.
+            and present the numbers using the `{tool_name}` tool/function.
             You will then receive a number as response.
-            When you receive this, simply say '{DONE} {PASS}'. 
+            When you receive this, 
+            {done_response}
+            to signal that you are done, and that the result is the number you received.
             """,
         )
     )
     agent.enable_message(AugmentTool)
+    if use_orch_tools:
+        agent.enable_message(DonePassTool)
+    else:
+        agent.disable_message_use(DonePassTool)
+    task_config = TaskConfig(recognize_string_signals=string_signals)
     task = Task(
         agent,
         interactive=False,
         done_if_no_response=[Entity.LLM],
+        config=task_config,
     )
 
-    response = task.run("100")
-    assert "101" in response.content
+    response = task.run("100", turns=10)
+    if use_orch_tools or string_signals:
+        assert "101" in response.content
+        assert len(agent.message_history) <= 5
+    else:
+        # no orch tool, and string signals ignored, so task doesn't terminate,
+        # and is limited by "turns" parameter
+        assert len(agent.message_history) > 7
 
 
 @pytest.mark.parametrize("use_fn_api", [True, False])
+@pytest.mark.parametrize("use_tools_api", [True, False])
+@pytest.mark.parametrize("use_orch_tools", [True, False])
 def test_task_2_agent_tool(
     test_settings: Settings,
     use_fn_api: bool,
+    use_tools_api: bool,
+    use_orch_tools: bool,
 ):
     """
     Test task loop where Agent B's task is a subtask of Agent A's task, and:
@@ -384,26 +459,38 @@ def test_task_2_agent_tool(
             super().__init__(config)
             self.enable_message(PolinskyTool, use=True, handle=True)
 
-        def polinsky(self, msg: PolinskyTool) -> str:
+        def polinsky(self, msg: PolinskyTool) -> str | PassTool:
             # No validation err, so pass it on
-            return PASS
+            if use_orch_tools:
+                return PassTool()
+            else:
+                return PASS
 
+    done_pass_tool_name = DonePassTool.default_value("request")
+    if use_orch_tools:
+        done_response = f"use the TOOL: `{done_pass_tool_name}`"
+    else:
+        done_response = f"say {DONE} {PASS}"
     requestor_agent = Requestor(
         ChatAgentConfig(
             name="Requestor",
             use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
             use_tools=not use_fn_api,
             system_message=f"""
                 User will send a number. Your job is to find out what is
                 the "Polinsky transform", which you KNOW is POSITIVE 
                 but do not know how to compute,
                 so you must use the `polinsky` tool/function to request it.
-                When you get a POSITIVE value, simply say '{DONE} {PASS}'.
+                When you get a POSITIVE value, 
+                {done_response}
+                to signal you're done.
                 If you get a NEGATIVE value, you must AGAIN request the Polinsky
                 of the ORIGINAL number, until you get a POSITIVE value.
                 """,
         )
     )
+    requestor_agent.enable_message(DonePassTool)
     requestor_task = Task(
         requestor_agent,
         interactive=False,
@@ -427,6 +514,7 @@ def test_task_2_agent_tool(
         ChatAgentConfig(
             name="Polinsky",
             use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
             use_tools=not use_fn_api,
             system_message="""
                 When you receive a number, respond with the DOUBLE of that number,
@@ -449,10 +537,14 @@ def test_task_2_agent_tool(
     assert "200" in response.content
 
 
-@pytest.mark.parametrize("use_fn_api", [True, False])
+@pytest.mark.parametrize("use_fn_api", [False, True])
+@pytest.mark.parametrize("use_tools_api", [True, False])
+@pytest.mark.parametrize("use_orch_tools", [False, True])
 def test_task_2_agent_2_tool(
     test_settings: Settings,
     use_fn_api: bool,
+    use_tools_api: bool,
+    use_orch_tools: bool,
 ):
     """
     QueryTool: Task A uses and handles (validates), Task B handles but doesn't use
@@ -481,10 +573,11 @@ def test_task_2_agent_2_tool(
             super().__init__(config)
             self.enable_message(QueryTool, use=True, handle=True)
             self.enable_message(FeedbackTool, use=False, handle=True)
+            self.enable_message(DoneTool)
 
-        def polinsky_query(self, msg: QueryTool) -> str:
+        def polinsky_query(self, msg: QueryTool) -> str | PassTool:
             # No validation err, so pass it on so other agent can respond
-            return PASS
+            return PassTool() if use_orch_tools else PASS
 
         def polinsky_feedback(self, msg: FeedbackTool) -> str:
             """Transmit feedback received from other agent, to this agent's LLM"""
@@ -500,10 +593,12 @@ def test_task_2_agent_2_tool(
                 {msg.feedback}
                 """
 
+    done_tool_name = DoneTool.default_value("request")
     requestor_agent = Requestor(
         ChatAgentConfig(
             name="Requestor",
             use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
             use_tools=not use_fn_api,
             system_message=f"""
                     Your mission is to find the "Polinsky transform" of TWO NUMBERS:
@@ -524,8 +619,9 @@ def test_task_2_agent_2_tool(
                         given feedback to guide your guess.
                         
                     When you have found out the Polinsky transform of 100 and 500,
-                    say "{DONE} and summarize the transforms in this format:
-                    'DONE (number1, transform1), (number2, transform2)'
+                    use the `{done_tool_name}` with `content` showing summary 
+                    of the transforms in this format:
+                    '(number1, transform1), (number2, transform2)'
                     """,
         )
     )
@@ -544,14 +640,15 @@ def test_task_2_agent_2_tool(
             # pass on the number so LLM can respond
             return f"Is the Polinsky transform of {msg.number} equal to {msg.value}?"
 
-        def polinsky_feedback(self, msg: FeedbackTool) -> str:
+        def polinsky_feedback(self, msg: FeedbackTool) -> str | DonePassTool:
             """Pass on the feedback to the Requestor"""
-            return DONE + " " + PASS
+            return DonePassTool() if use_orch_tools else DONE + " " + PASS
 
     critic_agent = Critic(
         ChatAgentConfig(
             name="Critic",
             use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
             use_tools=not use_fn_api,
             system_message="""
                     When you receive a query asking whether the Polinsky
@@ -574,3 +671,111 @@ def test_task_2_agent_2_tool(
     response = requestor_task.run()
     strings = "100 200 500 1000".split()
     assert all(s in response.content for s in strings)
+
+
+def test_task_tool_responses():
+    """Test that returning ToolMessage from an entity-responder or a Task.run() are
+    handled correctly"""
+
+    class IncrementTool(ToolMessage):
+        request = "increment"
+        purpose = "To increment a number"
+        x: int
+
+        def handle(self) -> str:
+            return DoneTool(content=str(self.x + 1))
+
+    class AnswerTool(ToolMessage):
+        request = "answer"
+        purpose = "To provide the final answer"
+        answer: int
+
+    class DoubleTool(ToolMessage):
+        request = "double"
+        purpose = "To double a number"
+        x: int
+
+        def handle(self) -> str:
+            # return this as the double_task's answer
+            return AgentDoneTool(tools=[AnswerTool(answer=2 * self.x)])
+
+    class HalveTool(ToolMessage):
+        request = "halve"
+        purpose = "To halve a number"
+        x: int
+
+        def handle(self) -> str:
+            return DoneTool(content=self.x // 2)  # note: content can be any type
+
+    class ProcessTool(ToolMessage):
+        request = "process"
+        purpose = "To process a number"
+        x: int
+
+        def handle(self) -> ToolMessage:
+            if self.x % 10 == 0:
+                return IncrementTool(x=self.x)
+            elif self.x % 2 == 0:
+                return HalveTool(x=self.x)
+            else:
+                return DoubleTool(x=self.x)
+
+    class ProcessorAgent(lr.ChatAgent):
+        def init_state(self):
+            super().init_state()
+            self.expecting_result: bool = False
+
+        def llm_response(
+            self, message: Optional[str | ChatDocument] = None
+        ) -> Optional[ChatDocument | ToolMessage]:
+            # return a ToolMessage rather than ChatDocument
+            msg_str = message.content if isinstance(message, ChatDocument) else message
+            if self.expecting_result:
+                if msg_str != "":
+                    return DoneTool(content=msg_str)
+                elif (
+                    isinstance(message, ChatDocument)
+                    and len(message.tool_messages) > 0
+                    and isinstance(message.tool_messages[0], AnswerTool)
+                ):
+                    # must be AnswerTool
+                    answer_tool: AnswerTool = message.tool_messages[0]
+                    return DoneTool(content=answer_tool.answer)
+                else:
+                    return None
+
+            x = int(msg_str)
+            self.expecting_result = True
+            return ProcessTool(x=x)
+
+    processor_agent = ProcessorAgent(lr.ChatAgentConfig(name="Processor"))
+    processor_agent.enable_message(ProcessTool)
+    processor_task = Task(processor_agent, interactive=False, restart=True)
+
+    halve_agent = lr.ChatAgent(lr.ChatAgentConfig(name="Halver", llm=None))
+    halve_agent.enable_message(HalveTool, use=False, handle=True)
+    halve_agent.enable_message(IncrementTool, use=False, handle=False)
+    halve_agent.enable_message(DoubleTool, use=False, handle=False)
+
+    halve_task = Task(halve_agent, interactive=False)
+
+    double_agent = lr.ChatAgent(lr.ChatAgentConfig(name="Doubler", llm=None))
+    double_agent.enable_message(DoubleTool, use=False, handle=True)
+    double_task = Task(double_agent, interactive=False)
+
+    increment_agent = lr.ChatAgent(lr.ChatAgentConfig(name="Incrementer", llm=None))
+    increment_agent.enable_message(IncrementTool, use=False, handle=True)
+    increment_agent.enable_message(DoubleTool, use=False, handle=False)
+    increment_task = Task(increment_agent, interactive=False)
+
+    processor_task.add_sub_task([halve_task, increment_task, double_task])
+
+    result = processor_task.run(str(3))
+    assert result.content == str(6)
+
+    # note: processor_agent state gets reset each time we run the task
+    result = processor_task.run(str(16))
+    assert result.content == str(8)
+
+    result = processor_task[int].run(10)
+    assert result == 11

@@ -79,7 +79,7 @@ class OpenAIAssistantConfig(ChatAgentConfig):
     # set to True once we can add Assistant msgs in threads
     cache_responses: bool = True
     timeout: int = 30  # can be different from llm.timeout
-    llm = OpenAIGPTConfig(chat_model=OpenAIChatModel.GPT4_TURBO)
+    llm = OpenAIGPTConfig(chat_model=OpenAIChatModel.GPT4o)
     tools: List[AssistantTool] = []
     files: List[str] = []
 
@@ -160,7 +160,7 @@ class OpenAIAssistant(ChatAgent):
 
     def enable_message(
         self,
-        message_class: Optional[Type[ToolMessage]],
+        message_class: Optional[Type[ToolMessage] | List[Type[ToolMessage]]],
         use: bool = True,
         handle: bool = True,
         force: bool = False,
@@ -173,6 +173,17 @@ class OpenAIAssistant(ChatAgent):
         fn-calling seems to pay attn to these, and if we don't want this,
         we should set this to False.
         """
+        if message_class is not None and isinstance(message_class, list):
+            for msg_class in message_class:
+                self.enable_message(
+                    msg_class,
+                    use=use,
+                    handle=handle,
+                    force=force,
+                    require_recipient=require_recipient,
+                    include_defaults=include_defaults,
+                )
+            return
         super().enable_message(
             message_class,
             use=use,
@@ -192,7 +203,7 @@ class OpenAIAssistant(ChatAgent):
             self.set_system_message(sys_msg.content)
         if not self.config.use_functions_api:
             return
-        functions, _ = self._function_args()
+        functions, _, _, _ = self._function_args()
         if functions is None:
             return
         # add the functions to the assistant:
@@ -720,7 +731,12 @@ class OpenAIAssistant(ChatAgent):
         """
         is_tool_output = False
         if message is not None:
-            llm_msg = ChatDocument.to_LLMMessage(message)
+            # note: to_LLMMessage returns a list of LLMMessage,
+            # which is allowed to have len > 1, in case the msg
+            # represents results of multiple (non-assistant) tool-calls.
+            # But for OAI Assistant, we only assume exactly one tool-call at a time.
+            # TODO look into multi-tools
+            llm_msg = ChatDocument.to_LLMMessage(message)[0]
             tool_id = llm_msg.tool_id
             if tool_id in self.pending_tool_ids:
                 if isinstance(message, ChatDocument):

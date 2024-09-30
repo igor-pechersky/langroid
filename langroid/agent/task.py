@@ -5,7 +5,7 @@ import copy
 import logging
 import re
 import threading
-from collections import Counter, deque
+from collections import Counter, OrderedDict, deque
 from pathlib import Path
 from types import SimpleNamespace
 from typing import (
@@ -18,7 +18,9 @@ from typing import (
     Optional,
     Tuple,
     Type,
+    TypeVar,
     cast,
+    overload,
 )
 
 import numpy as np
@@ -33,6 +35,8 @@ from langroid.agent.chat_document import (
     ChatDocument,
     StatusCode,
 )
+from langroid.agent.tool_message import ToolMessage
+from langroid.agent.tools.orchestration import AgentDoneTool, DoneTool, FinalResultTool
 from langroid.cachedb.redis_cachedb import RedisCache, RedisCacheConfig
 from langroid.exceptions import InfiniteLoopException
 from langroid.mytypes import Entity
@@ -51,10 +55,13 @@ from langroid.utils.constants import (
 from langroid.utils.logging import RichFileLogger, setup_file_logger
 from langroid.utils.object_registry import scheduled_cleanup
 from langroid.utils.system import hash
+from langroid.utils.types import to_string
 
 logger = logging.getLogger(__name__)
 
 Responder = Entity | Type["Task"]
+
+T = TypeVar("T")
 
 
 def noop_fn(*args: List[Any], **kwargs: Dict[str, Any]) -> None:
@@ -89,6 +96,14 @@ class TaskConfig(BaseModel):
             this is always enabled since this is a critical way for responders to
             indicate that the message should be sent to a specific entity/agent.
             (Search for "SEND_TO" in the examples/ dir to see how this is used.)
+        allow_subtask_multi_oai_tools (bool): whether to allow multiple OpenAI
+            tool-calls to be sent to a sub-task.
+        recognize_string_signals (bool): whether to recognize string-based signaling
+            like DONE, SEND_TO, PASS, etc. Default is True, but note that we don't need
+            to use string-based signaling, and it is recommended to use the
+            new Orchestration tools instead (see agent/tools/orchestration.py),
+            e.g. DoneTool, SendTool, etc.
+
     """
 
     inf_loop_cycle_len: int = 10
@@ -97,6 +112,8 @@ class TaskConfig(BaseModel):
     restart_as_subtask: bool = False
     logs_dir: str = "logs"
     addressing_prefix: str = ""
+    allow_subtask_multi_oai_tools: bool = True
+    recognize_string_signals: bool = True
 
 
 class Task:
@@ -148,6 +165,7 @@ class Task:
         erase_substeps: bool = False,
         allow_null_result: bool = False,
         max_stalled_steps: int = 5,
+        default_return_type: Optional[type] = None,
         done_if_no_response: List[Responder] = [],
         done_if_response: List[Responder] = [],
         config: TaskConfig = TaskConfig(),
@@ -185,6 +203,8 @@ class Task:
             default_human_response (str|None): default response from user; useful for
                 testing, to avoid interactive input from user.
                 [Instead of this, setting `interactive` usually suffices]
+            default_return_type: if not None, extracts a value of this type from the
+                result of self.run()
             interactive (bool): if true, wait for human input after each non-human
                 response (prevents infinite loop of non-human responses).
                 Default is true. If false, then `default_human_response` is set to ""
@@ -254,8 +274,7 @@ class Task:
         agent = cast(ChatAgent, agent)
         self.agent: ChatAgent = agent
         if isinstance(agent, ChatAgent) and len(agent.message_history) == 0 or restart:
-            self.agent.clear_history(0)
-            self.agent.clear_dialog()
+            self.agent.init_state()
             # possibly change the system and user messages
             if system_message:
                 # we always have at least 1 task_message
@@ -294,6 +313,7 @@ class Task:
         self.agent.interactive = interactive
         self.only_user_quits_root = only_user_quits_root
         self.message_history_idx = -1
+        self.default_return_type = default_return_type
 
         # set to True if we want to collapse multi-turn conversation with sub-tasks into
         # just the first outgoing message and last incoming message.
@@ -570,25 +590,63 @@ class Task:
         return self.pending_message
 
     def reset_all_sub_tasks(self) -> None:
-        """Recursively reset message history of own agent and all sub-tasks"""
-        self.agent.clear_history(0)
-        self.agent.clear_dialog()
+        """
+        Recursively reset message history & state of own agent and
+        those of all sub-tasks.
+        """
+        self.agent.init_state()
         for t in self.sub_tasks:
             t.reset_all_sub_tasks()
 
-    def run(
+    def __getitem__(self, return_type: type) -> Task:
+        """Returns a (shallow) copy of `self` with a default return type."""
+        clone = copy.copy(self)
+        clone.default_return_type = return_type
+        return clone
+
+    @overload
+    def run(  # noqa
         self,
-        msg: Optional[str | ChatDocument] = None,
+        msg: Any = None,
+        *,
         turns: int = -1,
         caller: None | Task = None,
         max_cost: float = 0,
         max_tokens: int = 0,
         session_id: str = "",
-    ) -> Optional[ChatDocument]:
+        allow_restart: bool = True,
+    ) -> Optional[ChatDocument]: ...  # noqa
+
+    @overload
+    def run(  # noqa
+        self,
+        msg: Any = None,
+        *,
+        turns: int = -1,
+        caller: None | Task = None,
+        max_cost: float = 0,
+        max_tokens: int = 0,
+        session_id: str = "",
+        allow_restart: bool = True,
+        return_type: Type[T],
+    ) -> Optional[T]: ...  # noqa
+
+    def run(
+        self,
+        msg: Any = None,
+        turns: int = -1,
+        caller: None | Task = None,
+        max_cost: float = 0,
+        max_tokens: int = 0,
+        session_id: str = "",
+        allow_restart: bool = True,
+        return_type: Optional[Type[T]] = None,
+    ) -> Optional[ChatDocument | T]:
         """Synchronous version of `run_async()`.
         See `run_async()` for details."""
-        if (self.restart and caller is None) or (
-            self.config_sub_task.restart_as_subtask and caller is not None
+        if allow_restart and (
+            (self.restart and caller is None)
+            or (self.config_sub_task.restart_as_subtask and caller is not None)
         ):
             # We are either at top level, with restart = True, OR
             # we are a sub-task with restart_as_subtask = True,
@@ -606,19 +664,18 @@ class Task:
         self._init_message_counter()
         self.history.clear()
 
-        assert (
-            msg is None or isinstance(msg, str) or isinstance(msg, ChatDocument)
-        ), f"msg arg in Task.run() must be None, str, or ChatDocument, not {type(msg)}"
+        msg_input = self.agent.to_ChatDocument(msg, author_entity=Entity.USER)
 
         if (
-            isinstance(msg, ChatDocument)
-            and msg.metadata.recipient != ""
-            and msg.metadata.recipient != self.name
+            isinstance(msg_input, ChatDocument)
+            and msg_input.metadata.recipient != ""
+            and msg_input.metadata.recipient != self.name
         ):
             # this task is not the intended recipient so return None
             return None
+
         self._pre_run_loop(
-            msg=msg,
+            msg=msg_input,
             caller=caller,
             is_async=False,
         )
@@ -669,23 +726,60 @@ class Task:
 
         final_result = self.result(status)
         self._post_run_loop()
+        if final_result is None:
+            return None
+
+        if return_type is None:
+            return_type = self.default_return_type
+
+        if return_type is not None and return_type != ChatDocument:
+            return self.agent.from_ChatDocument(final_result, return_type)
         return final_result
 
-    async def run_async(
+    @overload
+    async def run_async(  # noqa
         self,
-        msg: Optional[str | ChatDocument] = None,
+        msg: Any = None,
+        *,
         turns: int = -1,
         caller: None | Task = None,
         max_cost: float = 0,
         max_tokens: int = 0,
         session_id: str = "",
-    ) -> Optional[ChatDocument]:
+        allow_restart: bool = True,
+    ) -> Optional[ChatDocument]: ...  # noqa
+
+    @overload
+    async def run_async(  # noqa
+        self,
+        msg: Any = None,
+        *,
+        turns: int = -1,
+        caller: None | Task = None,
+        max_cost: float = 0,
+        max_tokens: int = 0,
+        session_id: str = "",
+        allow_restart: bool = True,
+        return_type: Type[T],
+    ) -> Optional[T]: ...  # noqa
+
+    async def run_async(
+        self,
+        msg: Any = None,
+        turns: int = -1,
+        caller: None | Task = None,
+        max_cost: float = 0,
+        max_tokens: int = 0,
+        session_id: str = "",
+        allow_restart: bool = True,
+        return_type: Optional[Type[T]] = None,
+    ) -> Optional[ChatDocument | T]:
         """
         Loop over `step()` until task is considered done or `turns` is reached.
         Runs asynchronously.
 
         Args:
-            msg (str|ChatDocument): initial *user-role* message to process; if None,
+            msg (Any): initial *user-role* message to process; if None,
                 the LLM will respond to its initial `self.task_messages`
                 which set up and kick off the overall task.
                 The agent tries to achieve this goal by looping
@@ -700,6 +794,8 @@ class Task:
             max_cost (float): max cost allowed for the task (default 0 -> no limit)
             max_tokens (int): max tokens allowed for the task (default 0 -> no limit)
             session_id (str): session id for the task
+            allow_restart (bool): whether to allow restarting the task
+            return_type (Optional[Type[T]]): desired final result type
 
         Returns:
             Optional[ChatDocument]: valid result of the task.
@@ -710,11 +806,9 @@ class Task:
         # message can be considered to be from the USER
         # (from the POV of this agent's LLM).
 
-        if (
-            self.restart
-            and caller is None
-            or self.config_sub_task.restart_as_subtask
-            and caller is not None
+        if allow_restart and (
+            (self.restart and caller is None)
+            or (self.config_sub_task.restart_as_subtask and caller is not None)
         ):
             # We are either at top level, with restart = True, OR
             # we are a sub-task with restart_as_subtask = True,
@@ -732,17 +826,20 @@ class Task:
         self._init_message_counter()
         self.history.clear()
 
+        msg_input = self.agent.to_ChatDocument(msg, author_entity=Entity.USER)
+
         if (
-            isinstance(msg, ChatDocument)
-            and msg.metadata.recipient != ""
-            and msg.metadata.recipient != self.name
+            isinstance(msg_input, ChatDocument)
+            and msg_input.metadata.recipient != ""
+            and msg_input.metadata.recipient != self.name
         ):
             # this task is not the intended recipient so return None
             return None
+
         self._pre_run_loop(
-            msg=msg,
+            msg=msg_input,
             caller=caller,
-            is_async=True,
+            is_async=False,
         )
         # self.turns overrides if it is > 0 and turns not set (i.e. = -1)
         turns = self.turns if turns < 0 else turns
@@ -792,6 +889,14 @@ class Task:
 
         final_result = self.result(status)
         self._post_run_loop()
+        if final_result is None:
+            return None
+
+        if return_type is None:
+            return_type = self.default_return_type
+
+        if return_type is not None and return_type != ChatDocument:
+            return self.agent.from_ChatDocument(final_result, return_type)
         return final_result
 
     def _pre_run_loop(
@@ -902,9 +1007,10 @@ class Task:
             and not self.human_tried
             and not self.agent.has_tool_message_attempt(self.pending_message)
         ):
-            # When in interactive mode,
             # Give human first chance if they haven't been tried in last step,
             # and the msg is not a tool-call attempt;
+            # (When `interactive=False`, human is only allowed to respond only if
+            #  if explicitly addressed)
             # This ensures human gets a chance to respond,
             #   other than to a LLM tool-call.
             # When there's a tool msg attempt we want the
@@ -923,7 +1029,6 @@ class Task:
                 # create dummy msg for logging
                 log_doc = ChatDocument(
                     content="[CANNOT RESPOND]",
-                    function_call=None,
                     metadata=ChatDocMetaData(
                         sender=r if isinstance(r, Entity) else Entity.USER,
                         sender_name=str(r),
@@ -1023,11 +1128,11 @@ class Task:
         # (responder, result) from a responder who explicitly said NO_ANSWER
         no_answer_response: None | Tuple[Responder, ChatDocument] = None
         for r in responders:
+            self.is_pass_thru = False
             if not self._can_respond(r):
                 # create dummy msg for logging
                 log_doc = ChatDocument(
                     content="[CANNOT RESPOND]",
-                    function_call=None,
                     metadata=ChatDocMetaData(
                         sender=r if isinstance(r, Entity) else Entity.USER,
                         sender_name=str(r),
@@ -1097,10 +1202,7 @@ class Task:
         # Contrast this with self.pending_message.metadata.sender, which is an ENTITY
         # of this agent, or a sub-task's agent.
         if not self.is_pass_thru:
-            if (
-                self.pending_message is not None
-                and self.pending_message.metadata.agent_id == self.agent.id
-            ):
+            if self.pending_message is not None and not isinstance(r, Task):
                 # when pending msg is from our own agent, respect the sender set there,
                 # since sometimes a response may "mock" as if the response is from
                 # another entity (e.g when using RewindTool, the agent handler
@@ -1111,7 +1213,7 @@ class Task:
                 self.pending_sender = r
             self.pending_message = result
         # set the parent/child links ONLY if not already set by agent internally,
-        # which may happen when using the RewindTool
+        # which may happen when using the RewindTool, or in other scenarios.
         if parent is not None and not result.metadata.parent_id:
             result.metadata.parent_id = parent.id()
         if parent is not None and not parent.metadata.child_id:
@@ -1166,6 +1268,26 @@ class Task:
             msg_str = escape(str(self.pending_message))
             print(f"[grey37][{sender_str}]{msg_str}[/grey37]")
 
+    def _forbid_multi_oai_tools(self, e: Responder) -> ChatDocument:
+        # Passing multiple OpenAI Tools to be handled by another agent
+        # is not supported yet (we need to carefully establish correspondence
+        # between the original tool-calls of agent A, and the returned results,
+        # which may involve recursive-called tools by agent B).
+        # So we set an error result corresponding to each tool-call.
+        assert isinstance(
+            e, Task
+        ), "Forbidding multiple OAI tools only applies to a responder of type Task"
+        err_str = """
+                    ERROR: cannot pass multiple tools to another agent!
+                    Please use ONE tool at a time!
+                """
+        id2result = OrderedDict((tc.id, err_str) for tc in self.agent.oai_tool_calls)
+        result = e.agent.create_user_response(
+            content="",
+            oai_tool_id2result=id2result,
+        )
+        return result
+
     def response(
         self,
         e: Responder,
@@ -1178,15 +1300,40 @@ class Task:
             actual_turns = e.turns if e.turns > 0 else turns
             e.agent.callbacks.set_parent_agent(self.agent)
             # e.callbacks.set_parent_agent(self.agent)
-            result = e.run(
-                self.pending_message,
-                turns=actual_turns,
-                caller=self,
-                max_cost=self.max_cost,
-                max_tokens=self.max_tokens,
-            )
+            pending_tools = self.agent.get_tool_messages(self.pending_message)
+            # TODO disable this
+            if (
+                len(pending_tools) > 1
+                and len(self.agent.oai_tool_calls) > 1
+                and not self.config.allow_subtask_multi_oai_tools
+            ):
+                result = self._forbid_multi_oai_tools(e)
+            else:
+                result = e.run(
+                    self.pending_message,
+                    turns=actual_turns,
+                    caller=self,
+                    max_cost=self.max_cost,
+                    max_tokens=self.max_tokens,
+                )
+                if result is not None:
+                    content, id2result, oai_tool_id = self.agent.process_tool_results(
+                        result.content,
+                        result.oai_tool_id2result,
+                        (
+                            self.pending_message.oai_tool_calls
+                            if isinstance(self.pending_message, ChatDocument)
+                            else None
+                        ),
+                    )
+                    result.content = content
+                    result.oai_tool_id2result = id2result
+                    result.metadata.oai_tool_id = oai_tool_id
+
             result_str = (  # only used by callback to display content and possible tool
-                "NONE" if result is None else str(ChatDocument.to_LLMMessage(result))
+                "NONE"
+                if result is None
+                else "\n\n".join(str(m) for m in ChatDocument.to_LLMMessage(result))
             )
             maybe_tool = len(extract_top_level_json(result_str)) > 0
             self.callbacks.show_subtask_response(
@@ -1197,15 +1344,36 @@ class Task:
         else:
             response_fn = self._entity_responder_map[cast(Entity, e)]
             result = response_fn(self.pending_message)
-        return self._process_result_routing(result)
+
+        result_chat_doc = self.agent.to_ChatDocument(
+            result,
+            chat_doc=self.pending_message,
+            author_entity=e if isinstance(e, Entity) else Entity.USER,
+        )
+        return self._process_result_routing(result_chat_doc, e)
 
     def _process_result_routing(
-        self, result: ChatDocument | None
+        self, result: ChatDocument | None, e: Responder
     ) -> ChatDocument | None:
         # process result in case there is a routing instruction
         if result is None:
             return None
-        # if result content starts with @name, set recipient to name
+        if isinstance(result, ToolMessage):
+            # this supports Agent responders and Task.run() to
+            # return a ToolMessage, in addition str, ChatDocument
+            if isinstance(e, Task):
+                # With the curr defn of Task.result(),
+                # Task.run() can't return a ToolMessage, so this case doesn't occur,
+                # but we leave it here in case a
+                # Task subclass overrides default behavior
+                return e.agent.create_user_response(tool_messages=[result])
+            else:
+                # e must be this agent's Entity (LLM, AGENT or USER)
+                return self.agent.response_template(e=e, tool_messages=[result])
+        if not self.config.recognize_string_signals:
+            # ignore all string-based signaling/routing
+            return result
+        # parse various routing/addressing strings in result
         is_pass, recipient, content = parse_routing(
             result,
             addressing_prefix=self.config.addressing_prefix,
@@ -1258,15 +1426,42 @@ class Task:
         if isinstance(e, Task):
             actual_turns = e.turns if e.turns > 0 else turns
             e.agent.callbacks.set_parent_agent(self.agent)
-            # e.callbacks.set_parent_agent(self.agent)
-            result = await e.run_async(
-                self.pending_message,
-                turns=actual_turns,
-                caller=self,
-                max_cost=self.max_cost,
-                max_tokens=self.max_tokens,
+            pending_tools = self.agent.get_tool_messages(self.pending_message)
+            # TODO disable this
+            if (
+                len(pending_tools) > 1
+                and len(self.agent.oai_tool_calls) > 1
+                and not self.config.allow_subtask_multi_oai_tools
+            ):
+                result = self._forbid_multi_oai_tools(e)
+            else:
+                # e.callbacks.set_parent_agent(self.agent)
+                result = await e.run_async(
+                    self.pending_message,
+                    turns=actual_turns,
+                    caller=self,
+                    max_cost=self.max_cost,
+                    max_tokens=self.max_tokens,
+                )
+                if result is not None:
+                    content, id2result, oai_tool_id = self.agent.process_tool_results(
+                        result.content,
+                        result.oai_tool_id2result,
+                        (
+                            self.pending_message.oai_tool_calls
+                            if isinstance(self.pending_message, ChatDocument)
+                            else None
+                        ),
+                    )
+                    result.content = content
+                    result.oai_tool_id2result = id2result
+                    result.metadata.oai_tool_id = oai_tool_id
+
+            result_str = (  # only used by callback to display content and possible tool
+                "NONE"
+                if result is None
+                else "\n\n".join(str(m) for m in ChatDocument.to_LLMMessage(result))
             )
-            result_str = str(ChatDocument.to_LLMMessage(result))
             maybe_tool = len(extract_top_level_json(result_str)) > 0
             self.callbacks.show_subtask_response(
                 task=e,
@@ -1276,7 +1471,13 @@ class Task:
         else:
             response_fn = self._entity_responder_async_map[cast(Entity, e)]
             result = await response_fn(self.pending_message)
-        return self._process_result_routing(result)
+
+        result_chat_doc = self.agent.to_ChatDocument(
+            result,
+            chat_doc=self.pending_message,
+            author_entity=e if isinstance(e, Entity) else Entity.USER,
+        )
+        return self._process_result_routing(result_chat_doc, e)
 
     def result(self, status: StatusCode | None = None) -> ChatDocument | None:
         """
@@ -1298,11 +1499,34 @@ class Task:
         result_msg = self.pending_message
 
         content = result_msg.content if result_msg else ""
-        if DONE in content:
+        content_any = result_msg.content_any if result_msg else None
+        if DONE in content and self.config.recognize_string_signals:
             # assuming it is of the form "DONE: <content>"
             content = content.replace(DONE, "").strip()
+        oai_tool_calls = result_msg.oai_tool_calls if result_msg else None
+        oai_tool_id2result = result_msg.oai_tool_id2result if result_msg else None
         fun_call = result_msg.function_call if result_msg else None
         tool_messages = result_msg.tool_messages if result_msg else []
+        # if there is an LLMDoneTool or AgentDoneTool among these,
+        # we extract content and tools from here, and ignore all others
+        for t in tool_messages:
+            if isinstance(t, FinalResultTool):
+                content = ""
+                content_any = None
+                tool_messages = [t]  # pass it on to parent so it also quits
+                break
+            elif isinstance(t, (AgentDoneTool, DoneTool)):
+                # there shouldn't be multiple tools like this; just take the first
+                content = to_string(t.content)
+                content_any = t.content
+                if isinstance(t, AgentDoneTool):
+                    tool_messages = t.tools
+                break
+        # drop the "Done" tools since they should not be part of the task result,
+        # or else they would cause the parent task to get unintentionally done!
+        tool_messages = [
+            t for t in tool_messages if not isinstance(t, (DoneTool, AgentDoneTool))
+        ]
         block = result_msg.metadata.block if result_msg else None
         recipient = result_msg.metadata.recipient if result_msg else ""
         tool_ids = result_msg.metadata.tool_ids if result_msg else []
@@ -1312,6 +1536,9 @@ class Task:
         # since to the "parent" task, this result is equivalent to a response from USER
         result_doc = ChatDocument(
             content=content,
+            content_any=content_any,
+            oai_tool_calls=oai_tool_calls,
+            oai_tool_id2result=oai_tool_id2result,
             function_call=fun_call,
             tool_messages=tool_messages,
             metadata=ChatDocMetaData(
@@ -1339,13 +1566,17 @@ class Task:
         Returns:
             bool: True if msg is (equivalent to) empty or None, False otherwise
         """
+        # if ignoring string-based signaling, set pass_str to ""
+        pass_str = PASS if self.config.recognize_string_signals else ""
         return (
             msg is None
-            or (isinstance(msg, str) and msg.strip() in [PASS, ""])
+            or (isinstance(msg, str) and msg.strip() in [pass_str, ""])
             or (
                 isinstance(msg, ChatDocument)
-                and msg.content.strip() in [PASS, ""]
+                and msg.content.strip() in [pass_str, ""]
                 and msg.function_call is None
+                and msg.oai_tool_calls is None
+                and msg.oai_tool_id2result is None
                 and msg.tool_messages == []
             )
         )
@@ -1355,9 +1586,19 @@ class Task:
     ) -> bool:
         """Is the task done based on the response from the given responder?"""
 
+        allow_done_string = self.config.recognize_string_signals
         response_says_done = result is not None and (
-            (isinstance(result, str) and DONE in result)
-            or (isinstance(result, ChatDocument) and DONE in result.content)
+            (isinstance(result, str) and DONE in result and allow_done_string)
+            or (
+                isinstance(result, ChatDocument)
+                and (
+                    (DONE in result.content and allow_done_string)
+                    or any(
+                        isinstance(t, (DoneTool, AgentDoneTool, FinalResultTool))
+                        for t in result.tool_messages
+                    )
+                )
+            )
         )
         return (
             (
@@ -1469,13 +1710,27 @@ class Task:
         if self._is_kill():
             return (True, StatusCode.KILL)
         result = result or self.pending_message
+        allow_done_string = self.config.recognize_string_signals
+        # An entity decided task is done, either via DoneTool,
+        # or by explicitly saying DONE
+        done_result = result is not None and (
+            (
+                DONE in (result.content if isinstance(result, str) else result.content)
+                and allow_done_string
+            )
+            or any(
+                isinstance(t, (DoneTool, AgentDoneTool, FinalResultTool))
+                for t in result.tool_messages
+            )
+        )
+
         user_quit = (
             result is not None
-            and (result.content in USER_QUIT_STRINGS or DONE in result.content)
+            and (result.content in USER_QUIT_STRINGS or done_result)
             and result.metadata.sender == Entity.USER
         )
-        if self._level == 0 and self.interactive and self.only_user_quits_root:
-            # for top-level task, in interactive mode, only user can quit out
+        if self._level == 0 and self._user_can_respond() and self.only_user_quits_root:
+            # for top-level task, only user can quit out
             return (user_quit, StatusCode.USER_QUIT if user_quit else StatusCode.OK)
 
         if self.is_done:
@@ -1510,8 +1765,7 @@ class Task:
         final = (
             # no valid response from any entity/agent in current turn
             result is None
-            # An entity decided task is done
-            or DONE in result.content
+            or done_result
             or (  # current task is addressing message to caller task
                 self.caller is not None
                 and self.caller.name != ""
@@ -1630,13 +1884,16 @@ class Task:
             and recipient != self.name  # case sensitive
         )
 
-    def _can_respond(self, e: Responder) -> bool:
-        user_can_respond = self.interactive or (
+    def _user_can_respond(self) -> bool:
+        return self.interactive or (
             # regardless of self.interactive, if a msg is explicitly addressed to
             # user, then wait for user response
             self.pending_message is not None
             and self.pending_message.metadata.recipient == Entity.USER
         )
+
+    def _can_respond(self, e: Responder) -> bool:
+        user_can_respond = self._user_can_respond()
 
         if self.pending_sender == e or (e == Entity.USER and not user_can_respond):
             # sender is same as e (an entity cannot respond to its own msg),
@@ -1645,6 +1902,9 @@ class Task:
 
         if self.pending_message is None:
             return True
+        if isinstance(e, Task) and not e.agent.can_respond(self.pending_message):
+            return False
+
         if self._recipient_mismatch(e):
             # Cannot respond if not addressed to this entity
             return False

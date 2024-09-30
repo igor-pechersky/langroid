@@ -46,6 +46,8 @@ This Multi-Agent paradigm is inspired by the
 `Langroid` is a fresh take on LLM app-development, where considerable thought has gone 
 into simplifying the developer experience; it does not use `Langchain`.
 
+:fire: Read the (WIP) [overview of the langroid architecture](https://langroid.github.io/langroid/blog/2024/08/15/overview-of-langroids-multi-agent-architecture-prelim/)
+
 📢 Companies are using/adapting Langroid in **production**. Here is a quote:
 
 >[Nullify](https://www.nullify.ai) uses AI Agents for secure software development. 
@@ -54,6 +56,9 @@ into simplifying the developer experience; it does not use `Langchain`.
 
 :fire: See this [Intro to Langroid](https://lancedb.substack.com/p/langoid-multi-agent-programming-framework)
 blog post from the LanceDB team
+
+:fire: Just published in ML for Healthcare (2024): a Langroid-based Multi-Agent RAG system for 
+pharmacovigilance, see [blog post](https://langroid.github.io/langroid/blog/2024/08/12/malade-multi-agent-architecture-for-pharmacovigilance/)
 
 
 We welcome contributions -- See the [contributions](./CONTRIBUTING.md) document
@@ -129,6 +134,16 @@ teacher_task.run()
 <details>
 <summary> <b>Click to expand</b></summary>
 
+- **Sep 2024:**
+  - **[0.16.0](https://github.com/langroid/langroid/releases/tag/0.16.0)**  Support for OpenAI `o1-mini` and `o1-preview` models.
+  - **[0.15.0](https://github.com/langroid/langroid/releases/tag/0.15.0)** Cerebras API support -- run llama-3.1 models hosted on Cerebras Cloud (very fast inference).
+  - **[0.14.0](https://github.com/langroid/langroid/releases/tag/0.14.0)** `DocChatAgent` uses Reciprocal Rank Fusion (RRF) to rank chunks retrieved by different methods.
+  - **[0.12.0](https://github.com/langroid/langroid/releases/tag/0.12.0)** `run_batch_task` new option -- `stop_on_first_result` - allows termination of batch as soon as any task returns a result.  
+- **Aug 2024:**
+  - **[0.11.0](https://github.com/langroid/langroid/releases/tag/0.11.0)** Polymorphic `Task.run(), Task.run_async`.
+  - **[0.10.0](https://github.com/langroid/langroid/releases/tag/0.10.0)** Allow tool handlers to return arbitrary result type, including other tools.
+  - **[0.9.0](https://github.com/langroid/langroid/releases/tag/0.9.0)** Orchestration Tools, to signal various task statuses, and to pass messages between agents.
+  - **[0.7.0](https://github.com/langroid/langroid/releases/tag/0.7.0)** OpenAI tools API support, including multi-tools.
 - **Jul 2024:**
   - **[0.3.0](https://github.com/langroid/langroid/releases/tag/0.3.0)**: Added [FastEmbed](https://qdrant.github.io/fastembed/qdrant/Usage_With_Qdrant/) embeddings from Qdrant
 - **Jun 2024:**

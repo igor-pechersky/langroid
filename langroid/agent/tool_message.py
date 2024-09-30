@@ -15,11 +15,12 @@ from typing import Any, Dict, List, Tuple, Type
 from docstring_parser import parse
 
 from langroid.language_models.base import LLMFunctionSpec
-from langroid.pydantic_v1 import BaseModel
+from langroid.pydantic_v1 import BaseModel, Extra
 from langroid.utils.pydantic_utils import (
     _recursive_purge_dict_key,
     generate_simple_schema,
 )
+from langroid.utils.types import is_instance_of
 
 
 class ToolMessage(ABC, BaseModel):
@@ -39,14 +40,20 @@ class ToolMessage(ABC, BaseModel):
 
     request: str
     purpose: str
+    id: str = ""  # placeholder for OpenAI-API tool_call_id
+
+    _allow_llm_use: bool = True  # allow an LLM to use (i.e. generate) this tool?
+
+    # model_config = ConfigDict(extra=Extra.allow)
 
     class Config:
+        extra = Extra.allow
         arbitrary_types_allowed = False
         validate_all = True
         validate_assignment = True
         # do not include these fields in the generated schema
         # since we don't require the LLM to specify them
-        schema_extra = {"exclude": {"purpose"}}
+        schema_extra = {"exclude": {"purpose", "id"}}
 
     @classmethod
     def instructions(cls) -> str:
@@ -108,13 +115,22 @@ class ToolMessage(ABC, BaseModel):
         return "\n\n".join(examples_jsons)
 
     def to_json(self) -> str:
-        return self.json(indent=4, exclude={"purpose"})
+        return self.json(indent=4, exclude=self.Config.schema_extra["exclude"])
 
     def json_example(self) -> str:
-        return self.json(indent=4, exclude={"purpose"})
+        return self.json(indent=4, exclude=self.Config.schema_extra["exclude"])
 
     def dict_example(self) -> Dict[str, Any]:
-        return self.dict(exclude={"purpose"})
+        return self.dict(exclude=self.Config.schema_extra["exclude"])
+
+    def get_value_of_type(self, target_type: Type[Any]) -> Any:
+        """Try to find a value of a desired type in the fields of the ToolMessage."""
+        ignore_fields = self.Config.schema_extra["exclude"].union(["request"])
+        for field_name in set(self.dict().keys()) - ignore_fields:
+            value = getattr(self, field_name)
+            if is_instance_of(value, target_type):
+                return value
+        return None
 
     @classmethod
     def default_value(cls, f: str) -> Any:
@@ -218,7 +234,9 @@ class ToolMessage(ABC, BaseModel):
                 if "description" not in parameters["properties"][name]:
                     parameters["properties"][name]["description"] = description
 
-        excludes = ["purpose"] if request else ["request", "purpose"]
+        excludes = cls.Config.schema_extra["exclude"]
+        if not request:
+            excludes = excludes.union({"request"})
         # exclude 'excludes' from parameters["properties"]:
         parameters["properties"] = {
             field: details
@@ -259,5 +277,8 @@ class ToolMessage(ABC, BaseModel):
         Returns:
             Dict[str, Any]: simplified schema
         """
-        schema = generate_simple_schema(cls, exclude=["purpose"])
+        schema = generate_simple_schema(
+            cls,
+            exclude=list(cls.Config.schema_extra["exclude"]),
+        )
         return schema

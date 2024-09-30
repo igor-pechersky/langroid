@@ -16,8 +16,10 @@ from langroid.language_models.base import (
     LLMFunctionSpec,
     LLMMessage,
     LLMResponse,
+    OpenAIToolSpec,
     Role,
     StreamingIfAllowed,
+    ToolChoiceTypes,
 )
 from langroid.language_models.openai_gpt import OpenAIGPT
 from langroid.utils.configuration import settings
@@ -39,14 +41,22 @@ class ChatAgentConfig(AgentConfig):
         user_message: user message to include in message sequence.
              Used only if `task` is not specified in the constructor.
         use_tools: whether to use our own ToolMessages mechanism
-        use_functions_api: whether to use functions native to the LLM API
-                (e.g. OpenAI's `function_call` mechanism)
+        use_functions_api: whether to use functions/tools native to the LLM API
+                (e.g. OpenAI's `function_call` or `tool_call` mechanism)
+        use_tools_api: When `use_functions_api` is True, if this is also True,
+            the OpenAI tool-call API is used, rather than the older/deprecated
+            function-call API. However the tool-call API has some tricky aspects,
+            hence we set this to False by default.
+        enable_orchestration_tool_handling: whether to enable handling of orchestration
+            tools, e.g. ForwardTool, DoneTool, PassTool, etc.
     """
 
     system_message: str = "You are a helpful assistant."
     user_message: Optional[str] = None
     use_tools: bool = False
     use_functions_api: bool = True
+    use_tools_api: bool = False
+    enable_orchestration_tool_handling: bool = True
 
     def _set_fn_or_tools(self, fn_available: bool) -> None:
         """
@@ -108,7 +118,7 @@ class ChatAgent(Agent):
         self.config: ChatAgentConfig = config
         self.config._set_fn_or_tools(self._fn_call_available())
         self.message_history: List[LLMMessage] = []
-        self.tool_instructions_added: bool = False
+        self.init_state()
         # An agent's "task" is defined by a system msg and an optional user msg;
         # These are "priming" messages that kick off the agent's conversation.
         self.system_message: str = self.config.system_message
@@ -137,6 +147,41 @@ class ChatAgent(Agent):
         self.llm_functions_handled: Set[str] = set()
         self.llm_functions_usable: Set[str] = set()
         self.llm_function_force: Optional[Dict[str, str]] = None
+
+        if self.config.enable_orchestration_tool_handling:
+            # Only enable HANDLING by `agent_response`, NOT LLM generation of these.
+            # This is useful where tool-handlers or agent_response generate these
+            # tools, and need to be handled.
+            # We don't want enable orch tool GENERATION by default, since that
+            # might clutter-up the LLM system message unnecessarily.
+            from langroid.agent.tools.orchestration import (
+                AgentDoneTool,
+                AgentSendTool,
+                DonePassTool,
+                DoneTool,
+                ForwardTool,
+                PassTool,
+                ResultTool,
+                SendTool,
+            )
+
+            self.enable_message(ForwardTool, use=False, handle=True)
+            self.enable_message(DoneTool, use=False, handle=True)
+            self.enable_message(AgentDoneTool, use=False, handle=True)
+            self.enable_message(PassTool, use=False, handle=True)
+            self.enable_message(DonePassTool, use=False, handle=True)
+            self.enable_message(SendTool, use=False, handle=True)
+            self.enable_message(AgentSendTool, use=False, handle=True)
+            self.enable_message(ResultTool, use=False, handle=True)
+
+    def init_state(self) -> None:
+        """
+        Initialize the state of the agent. Just conversation state here,
+        but subclasses can override this to initialize other state.
+        """
+        super().init_state()
+        self.clear_history(0)
+        self.clear_dialog()
 
     @staticmethod
     def from_id(id: str) -> "ChatAgent":
@@ -181,6 +226,7 @@ class ChatAgent(Agent):
             self.llm is not None
             and isinstance(self.llm, OpenAIGPT)
             and self.llm.is_openai_chat_model()
+            and self.llm.supports_functions_or_tools()
         )
 
     def set_system_message(self, msg: str) -> None:
@@ -205,6 +251,23 @@ class ChatAgent(Agent):
             msgs.append(LLMMessage(role=Role.USER, content=self.user_message))
         return msgs
 
+    def _drop_msg_update_tool_calls(self, msg: LLMMessage) -> None:
+        id2idx = {t.id: i for i, t in enumerate(self.oai_tool_calls)}
+        if msg.role == Role.TOOL:
+            # dropping tool result, so ADD the corresponding tool-call back
+            # to the list of pending calls!
+            id = msg.tool_call_id
+            if id in self.oai_tool_id2call:
+                self.oai_tool_calls.append(self.oai_tool_id2call[id])
+        elif msg.tool_calls is not None:
+            # dropping a msg with tool-calls, so DROP these from pending list
+            # as well as from id -> call map
+            for tool_call in msg.tool_calls:
+                if tool_call.id in id2idx:
+                    self.oai_tool_calls.pop(id2idx[tool_call.id])
+                if tool_call.id in self.oai_tool_id2call:
+                    del self.oai_tool_id2call[tool_call.id]
+
     def clear_history(self, start: int = -2) -> None:
         """
         Clear the message history, starting at the index `start`
@@ -218,7 +281,10 @@ class ChatAgent(Agent):
             n = len(self.message_history)
             start = max(0, n + start)
         dropped = self.message_history[start:]
-        for msg in dropped:
+        # consider the dropped msgs in REVERSE order, so we are
+        # carefully updating self.oai_tool_calls
+        for msg in reversed(dropped):
+            self._drop_msg_update_tool_calls(msg)
             # clear out the chat document from the ObjectRegistry
             ChatDocument.delete_id(msg.chat_document_id)
         self.message_history = self.message_history[:start]
@@ -245,19 +311,24 @@ class ChatAgent(Agent):
         Returns:
             str: formatting rules
         """
-        enabled_classes: List[Type[ToolMessage]] = list(self.llm_tools_map.values())
-        if len(enabled_classes) == 0:
+        # ONLY Usable tools (i.e. LLM-generation allowed),
+        usable_tool_classes: List[Type[ToolMessage]] = [
+            t
+            for t in list(self.llm_tools_map.values())
+            if t.default_value("request") in self.llm_tools_usable
+        ]
+
+        if len(usable_tool_classes) == 0:
             return "You can ask questions in natural language."
         json_instructions = "\n\n".join(
             [
                 msg_cls.json_instructions(tool=self.config.use_tools)
-                for _, msg_cls in enumerate(enabled_classes)
-                if msg_cls.default_value("request") in self.llm_tools_usable
+                for msg_cls in usable_tool_classes
             ]
         )
         # if any of the enabled classes has json_group_instructions, then use that,
         # else fall back to ToolMessage.json_group_instructions
-        for msg_cls in enabled_classes:
+        for msg_cls in usable_tool_classes:
             if hasattr(msg_cls, "json_group_instructions") and callable(
                 getattr(msg_cls, "json_group_instructions")
             ):
@@ -393,9 +464,16 @@ class ChatAgent(Agent):
         # remove leading and trailing newlines and other whitespace
         return LLMMessage(role=Role.SYSTEM, content=content.strip())
 
+    def unhandled_tools(self) -> set[str]:
+        """The set of tools that are known but not handled.
+        Useful in task flow: an agent can refuse to accept an incoming msg
+        when it only has unhandled tools.
+        """
+        return self.llm_tools_known - self.llm_tools_handled
+
     def enable_message(
         self,
-        message_class: Optional[Type[ToolMessage]],
+        message_class: Optional[Type[ToolMessage] | List[Type[ToolMessage]]],
         use: bool = True,
         handle: bool = True,
         force: bool = False,
@@ -408,8 +486,10 @@ class ChatAgent(Agent):
         - tool HANDLING (i.e. the agent can handle JSON from this tool),
 
         Args:
-            message_class: The ToolMessage class to enable,
+            message_class: The ToolMessage class OR List of such classes to enable,
                 for USE, or HANDLING, or both.
+                If this is a list of ToolMessage classes, then the remain args are
+                applied to all classes.
                 Optional; if None, then apply the enabling to all tools in the
                 agent's toolset that have been enabled so far.
             use: IF True, allow the agent (LLM) to use this tool (or all tools),
@@ -421,18 +501,36 @@ class ChatAgent(Agent):
                  `force` is ignored if `message_class` is None.
             require_recipient: whether to require that recipient be specified
                 when using the tool message (only applies if `use` is True).
-            require_defaults: whether to include fields that have default values,
+            include_defaults: whether to include fields that have default values,
                 in the "properties" section of the JSON format instructions.
                 (Normally the OpenAI completion API ignores these fields,
                 but the Assistant fn-calling seems to pay attn to these,
                 and if we don't want this, we should set this to False.)
         """
+        if message_class is not None and isinstance(message_class, list):
+            for mc in message_class:
+                self.enable_message(
+                    mc,
+                    use=use,
+                    handle=handle,
+                    force=force,
+                    require_recipient=require_recipient,
+                    include_defaults=include_defaults,
+                )
+            return None
         if require_recipient and message_class is not None:
             message_class = message_class.require_recipient()
         super().enable_message_handling(message_class)  # enables handling only
         tools = self._get_tool_list(message_class)
         if message_class is not None:
             request = message_class.default_value("request")
+            if request == "":
+                raise ValueError(
+                    f"""
+                    ToolMessage class {message_class} must have a non-empty 
+                    'request' field if it is to be enabled as a tool.
+                    """
+                )
             llm_function = message_class.llm_function_schema(defaults=include_defaults)
             self.llm_functions_map[request] = llm_function
             if force:
@@ -441,6 +539,8 @@ class ChatAgent(Agent):
                 self.llm_function_force = None
 
         for t in tools:
+            self.llm_tools_known.add(t)
+
             if handle:
                 self.llm_tools_handled.add(t)
                 self.llm_functions_handled.add(t)
@@ -449,8 +549,21 @@ class ChatAgent(Agent):
                 self.llm_functions_handled.discard(t)
 
             if use:
-                self.llm_tools_usable.add(t)
-                self.llm_functions_usable.add(t)
+                tool_class = self.llm_tools_map[t]
+                if tool_class._allow_llm_use:
+                    self.llm_tools_usable.add(t)
+                    self.llm_functions_usable.add(t)
+                else:
+                    logger.warning(
+                        f"""
+                        ToolMessage class {tool_class} does not allow LLM use,
+                        because `_allow_llm_use=False` either in the Tool or a 
+                        parent class of this tool;
+                        so not enabling LLM use for this tool!
+                        If you intended an LLM to use this tool, 
+                        set `_allow_llm_use=True` when you define the tool.
+                        """
+                    )
             else:
                 self.llm_tools_usable.discard(t)
                 self.llm_functions_usable.discard(t)
@@ -519,9 +632,14 @@ class ChatAgent(Agent):
         hist, output_len = self._prep_llm_messages(message)
         if len(hist) == 0:
             return None
+        tool_choice = (
+            "auto"
+            if isinstance(message, str)
+            else (message.oai_tool_choice if message is not None else "auto")
+        )
         with StreamingIfAllowed(self.llm, self.llm.get_stream()):
-            response = self.llm_response_messages(hist, output_len)
-        self.message_history.append(ChatDocument.to_LLMMessage(response))
+            response = self.llm_response_messages(hist, output_len, tool_choice)
+        self.message_history.extend(ChatDocument.to_LLMMessage(response))
         response.metadata.msg_idx = len(self.message_history) - 1
         response.metadata.agent_id = self.id
         # Preserve trail of tool_ids for OpenAI Assistant fn-calls
@@ -543,9 +661,16 @@ class ChatAgent(Agent):
         hist, output_len = self._prep_llm_messages(message)
         if len(hist) == 0:
             return None
+        tool_choice = (
+            "auto"
+            if isinstance(message, str)
+            else (message.oai_tool_choice if message is not None else "auto")
+        )
         with StreamingIfAllowed(self.llm, self.llm.get_stream()):
-            response = await self.llm_response_messages_async(hist, output_len)
-        self.message_history.append(ChatDocument.to_LLMMessage(response))
+            response = await self.llm_response_messages_async(
+                hist, output_len, tool_choice
+            )
+        self.message_history.extend(ChatDocument.to_LLMMessage(response))
         response.metadata.msg_idx = len(self.message_history) - 1
         response.metadata.agent_id = self.id
         # Preserve trail of tool_ids for OpenAI Assistant fn-calls
@@ -622,8 +747,18 @@ class ChatAgent(Agent):
             ):
                 # either the message is a str, or it is a fresh ChatDocument
                 # different from the last message in the history
-                llm_msg = ChatDocument.to_LLMMessage(message)
-                self.message_history.append(llm_msg)
+                llm_msgs = ChatDocument.to_LLMMessage(message, self.oai_tool_calls)
+                # LLM only responds to the content, so only those msgs with
+                # non-empty content should be kept
+                llm_msgs = [m for m in llm_msgs if m.content.strip() != ""]
+                if len(llm_msgs) == 0:
+                    return [], 0
+                # process tools if any
+                done_tools = [m.tool_call_id for m in llm_msgs if m.role == Role.TOOL]
+                self.oai_tool_calls = [
+                    t for t in self.oai_tool_calls if t.id not in done_tools
+                ]
+                self.message_history.extend(llm_msgs)
 
         hist = self.message_history
         output_len = self.config.llm.max_output_tokens
@@ -707,18 +842,47 @@ class ChatAgent(Agent):
 
     def _function_args(
         self,
-    ) -> Tuple[Optional[List[LLMFunctionSpec]], str | Dict[str, str]]:
+    ) -> Tuple[
+        Optional[List[LLMFunctionSpec]],
+        str | Dict[str, str],
+        Optional[List[OpenAIToolSpec]],
+        Optional[Dict[str, Dict[str, str] | str]],
+    ]:
+        """Get function/tool spec arguments for OpenAI-compatible LLM API call"""
         functions: Optional[List[LLMFunctionSpec]] = None
         fun_call: str | Dict[str, str] = "none"
+        tools: Optional[List[OpenAIToolSpec]] = None
+        force_tool: Optional[Dict[str, Dict[str, str] | str]] = None
         if self.config.use_functions_api and len(self.llm_functions_usable) > 0:
-            functions = [self.llm_functions_map[f] for f in self.llm_functions_usable]
-            fun_call = (
-                "auto" if self.llm_function_force is None else self.llm_function_force
-            )
-        return functions, fun_call
+            if not self.config.use_tools_api:
+                functions = [
+                    self.llm_functions_map[f] for f in self.llm_functions_usable
+                ]
+                fun_call = (
+                    "auto"
+                    if self.llm_function_force is None
+                    else self.llm_function_force
+                )
+            else:
+                tools = [
+                    OpenAIToolSpec(type="function", function=self.llm_functions_map[f])
+                    for f in self.llm_functions_usable
+                ]
+                force_tool = (
+                    None
+                    if self.llm_function_force is None
+                    else {
+                        "type": "function",
+                        "function": {"name": self.llm_function_force["name"]},
+                    }
+                )
+        return functions, fun_call, tools, force_tool
 
     def llm_response_messages(
-        self, messages: List[LLMMessage], output_len: Optional[int] = None
+        self,
+        messages: List[LLMMessage],
+        output_len: Optional[int] = None,
+        tool_choice: ToolChoiceTypes | Dict[str, str | Dict[str, str]] = "auto",
     ) -> ChatDocument:
         """
         Respond to a series of messages, e.g. with OpenAI ChatCompletion
@@ -748,11 +912,13 @@ class ChatAgent(Agent):
                 stack.enter_context(cm)
             if self.llm.get_stream() and not settings.quiet:
                 console.print(f"[green]{self.indent}", end="")
-            functions, fun_call = self._function_args()
+            functions, fun_call, tools, force_tool = self._function_args()
             assert self.llm is not None
             response = self.llm.chat(
                 messages,
                 output_len,
+                tools=tools,
+                tool_choice=force_tool or tool_choice,
                 functions=functions,
                 function_call=fun_call,
             )
@@ -775,23 +941,24 @@ class ChatAgent(Agent):
             print_response_stats=self.config.show_stats and not settings.quiet,
         )
         chat_doc = ChatDocument.from_LLMResponse(response, displayed=True)
+        self.oai_tool_calls = response.oai_tool_calls or []
+        self.oai_tool_id2call.update(
+            {t.id: t for t in self.oai_tool_calls if t.id is not None}
+        )
         return chat_doc
 
     async def llm_response_messages_async(
-        self, messages: List[LLMMessage], output_len: Optional[int] = None
+        self,
+        messages: List[LLMMessage],
+        output_len: Optional[int] = None,
+        tool_choice: ToolChoiceTypes | Dict[str, str | Dict[str, str]] = "auto",
     ) -> ChatDocument:
         """
         Async version of `llm_response_messages`. See there for details.
         """
         assert self.config.llm is not None and self.llm is not None
         output_len = output_len or self.config.llm.max_output_tokens
-        functions: Optional[List[LLMFunctionSpec]] = None
-        fun_call: str | Dict[str, str] = "none"
-        if self.config.use_functions_api and len(self.llm_functions_usable) > 0:
-            functions = [self.llm_functions_map[f] for f in self.llm_functions_usable]
-            fun_call = (
-                "auto" if self.llm_function_force is None else self.llm_function_force
-            )
+        functions, fun_call, tools, force_tool = self._function_args()
         assert self.llm is not None
 
         streamer = noop_fn
@@ -802,6 +969,8 @@ class ChatAgent(Agent):
         response = await self.llm.achat(
             messages,
             output_len,
+            tools=tools,
+            tool_choice=force_tool or tool_choice,
             functions=functions,
             function_call=fun_call,
         )
@@ -824,6 +993,10 @@ class ChatAgent(Agent):
             print_response_stats=self.config.show_stats and not settings.quiet,
         )
         chat_doc = ChatDocument.from_LLMResponse(response, displayed=True)
+        self.oai_tool_calls = response.oai_tool_calls or []
+        self.oai_tool_id2call.update(
+            {t.id: t for t in self.oai_tool_calls if t.id is not None}
+        )
         return chat_doc
 
     def _render_llm_response(
@@ -847,6 +1020,7 @@ class ChatAgent(Agent):
                     if isinstance(response, ChatDocument)
                     else ChatDocument.from_LLMResponse(response, displayed=True)
                 )
+                # TODO: prepend TOOL: or OAI-TOOL: if it's a tool-call
                 print(cached + "[green]" + escape(str(response)))
                 self.callbacks.show_llm_response(
                     content=str(response),
@@ -923,8 +1097,14 @@ class ChatAgent(Agent):
         # If there is a response, then we will have two additional
         # messages in the message history, i.e. the user message and the
         # assistant response. We want to (carefully) remove these two messages.
-        self.message_history.pop() if len(self.message_history) > n_msgs else None
-        self.message_history.pop() if len(self.message_history) > n_msgs else None
+        if len(self.message_history) > n_msgs:
+            msg = self.message_history.pop()
+            self._drop_msg_update_tool_calls(msg)
+
+        if len(self.message_history) > n_msgs:
+            msg = self.message_history.pop()
+            self._drop_msg_update_tool_calls(msg)
+
         return response
 
     async def llm_response_forget_async(self, message: str) -> ChatDocument:
@@ -941,8 +1121,13 @@ class ChatAgent(Agent):
         # If there is a response, then we will have two additional
         # messages in the message history, i.e. the user message and the
         # assistant response. We want to (carefully) remove these two messages.
-        self.message_history.pop() if len(self.message_history) > n_msgs else None
-        self.message_history.pop() if len(self.message_history) > n_msgs else None
+        if len(self.message_history) > n_msgs:
+            msg = self.message_history.pop()
+            self._drop_msg_update_tool_calls(msg)
+
+        if len(self.message_history) > n_msgs:
+            msg = self.message_history.pop()
+            self._drop_msg_update_tool_calls(msg)
         return response
 
     def chat_num_tokens(self, messages: Optional[List[LLMMessage]] = None) -> int:

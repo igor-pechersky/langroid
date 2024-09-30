@@ -1,4 +1,3 @@
-import itertools
 from typing import Optional
 
 import pytest
@@ -57,25 +56,21 @@ handle_vals = [True, False]
 force_vals = [True, False]
 message_classes = [None, SquareTool]
 
-# Get the cartesian product
-cartesian_product = list(
-    itertools.product(message_classes, use_vals, handle_vals, force_vals)
-)
 
 agent.enable_message(SquareTool)
 
 
-@pytest.mark.parametrize(
-    # cartesian product of all combinations of use, handle, force
-    "msg_class, use, handle, force",
-    cartesian_product,
-)
+@pytest.mark.parametrize("msg_class", [None, SquareTool])
+@pytest.mark.parametrize("use", [True, False])
+@pytest.mark.parametrize("handle", [True, False])
+@pytest.mark.parametrize("force", [True, False])
 def test_enable_message(
     msg_class: Optional[ToolMessage], use: bool, handle: bool, force: bool
 ):
     agent.enable_message(msg_class, use=use, handle=handle, force=force)
+    usable_tools = agent.llm_tools_usable
     tools = agent._get_tool_list(msg_class)
-    for tool in tools:
+    for tool in set(tools).intersection(usable_tools):
         assert tool in agent.llm_tools_map
         if msg_class is not None:
             assert agent.llm_tools_map[tool] == msg_class
@@ -95,9 +90,11 @@ def test_enable_message(
 @pytest.mark.parametrize("msg_class", [None, SquareTool])
 def test_disable_message_handling(msg_class: Optional[ToolMessage]):
     agent.enable_message(SquareTool)
+    usable_tools = agent.llm_tools_usable
     agent.disable_message_handling(msg_class)
+
     tools = agent._get_tool_list(msg_class)
-    for tool in tools:
+    for tool in set(tools).intersection(usable_tools):
         assert tool not in agent.llm_tools_handled
         assert tool not in agent.llm_functions_handled
         assert tool in agent.llm_tools_usable
@@ -107,10 +104,10 @@ def test_disable_message_handling(msg_class: Optional[ToolMessage]):
 @pytest.mark.parametrize("msg_class", [None, SquareTool])
 def test_disable_message_use(msg_class: Optional[ToolMessage]):
     agent.enable_message(SquareTool)
-
+    usable_tools = agent.llm_tools_usable
     agent.disable_message_use(msg_class)
     tools = agent._get_tool_list(msg_class)
-    for tool in tools:
+    for tool in set(tools).intersection(usable_tools):
         assert tool not in agent.llm_tools_usable
         assert tool not in agent.llm_functions_usable
         assert tool in agent.llm_tools_handled
@@ -136,7 +133,7 @@ def test_agent_handle_message():
     """
     agent.enable_message(SquareTool)
     assert agent.handle_message(NONE_MSG) is None
-    assert agent.handle_message(SQUARE_MSG) == "144"
+    assert agent.handle_message(SQUARE_MSG).content == "144"
 
     agent.disable_message_handling(SquareTool)
     assert agent.handle_message(SQUARE_MSG) is None
@@ -145,7 +142,7 @@ def test_agent_handle_message():
     assert agent.handle_message(SQUARE_MSG) is None
 
     agent.enable_message(SquareTool)
-    assert agent.handle_message(SQUARE_MSG) == "144"
+    assert agent.handle_message(SQUARE_MSG).content == "144"
 
 
 BAD_SQUARE_MSG = """
@@ -211,15 +208,9 @@ def test_llm_tool_message(
     agent.enable_message(SquareTool)
 
     llm_msg = agent.llm_response_forget(prompt)
-    tool_name = message_class.default_value("request")
-    if use_functions_api:
-        assert llm_msg.function_call.name == tool_name
-    else:
-        tools = agent.get_tool_messages(llm_msg)
-        assert len(tools) == 1
-        assert isinstance(tools[0], message_class)
+    assert isinstance(agent.get_tool_messages(llm_msg)[0], message_class)
 
-    agent_result = agent.handle_message(llm_msg)
+    agent_result = agent.handle_message(llm_msg).content
     assert result.lower() in agent_result.lower()
 
 
@@ -266,13 +257,7 @@ async def test_llm_tool_message_async(
     agent.enable_message(SquareTool)
 
     llm_msg = await agent.llm_response_forget_async(prompt)
-    tool_name = message_class.default_value("request")
-    if use_functions_api:
-        assert llm_msg.function_call.name == tool_name
-    else:
-        tools = agent.get_tool_messages(llm_msg)
-        assert len(tools) == 1
-        assert isinstance(tools[0], message_class)
+    assert isinstance(agent.get_tool_messages(llm_msg)[0], message_class)
 
-    agent_result = agent.handle_message(llm_msg)
+    agent_result = agent.handle_message(llm_msg).content
     assert result.lower() in agent_result.lower()

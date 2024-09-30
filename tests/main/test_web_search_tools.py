@@ -38,10 +38,12 @@ search_tools = [GoogleSearchTool, DuckduckgoSearchTool]
 
 @pytest.mark.parametrize("search_tool_cls", search_tools)
 @pytest.mark.parametrize("use_functions_api", [True, False])
+@pytest.mark.parametrize("use_tools_api", [True, False])
 def test_agent_google_search_tool(
     test_settings: Settings,
     search_tool_cls: lr.ToolMessage,
     use_functions_api: bool,
+    use_tools_api: bool,
 ):
     """
     Test whether LLM is able to GENERATE message (tool) in required format, AND the
@@ -55,21 +57,16 @@ def test_agent_google_search_tool(
     agent = ChatAgent(cfg)
     agent.config.use_functions_api = use_functions_api
     agent.config.use_tools = not use_functions_api
+    agent.config.use_tools_api = use_tools_api
     agent.enable_message(search_tool_cls)
 
     llm_msg = agent.llm_response_forget(
         "Find 3 results on the internet about the LK-99 superconducting material."
     )
-    tool_name = search_tool_cls.default_value("request")
-    if use_functions_api:
-        assert llm_msg.function_call.name == tool_name
-    else:
-        tools = agent.get_tool_messages(llm_msg)
-        assert len(tools) == 1
-        assert isinstance(tools[0], search_tool_cls)
+    assert isinstance(agent.get_tool_messages(llm_msg)[0], search_tool_cls)
 
     try:
-        agent_result = agent.handle_message(llm_msg)
+        agent_result = agent.handle_message(llm_msg).content
     except DuckDuckGoSearchException as e:
         pytest.skip(f"Skipping test: {e}")
     assert len(agent_result.split("\n\n")) == 3

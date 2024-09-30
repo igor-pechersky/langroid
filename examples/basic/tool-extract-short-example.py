@@ -10,6 +10,7 @@ python3 examples/basic/tool-extract-short-example.py
 
 import langroid as lr
 from langroid.pydantic_v1 import BaseModel, Field
+from langroid.agent.tools.orchestration import ResultTool
 
 
 # desired output structure
@@ -46,18 +47,22 @@ class CompanyInfoTool(lr.agent.ToolMessage):
             ),
         ]
 
-    def handle(self) -> str:
+    def handle(self) -> ResultTool:
         """Handle LLM's structured output if it matches CompanyInfo structure.
         This suffices for a "stateless" tool.
         If the tool handling requires agent state, then
         instead of this `handle` method, define a `company_info_tool`
         method in the agent.
+        Since this method is returning a  ResultTool,
+        the task of this agent will be terminated,
+        with this tool T appearing in the result ChatDocument's `tool_messages` list.
         """
         mkt_cap = self.company_info.shares * self.company_info.price
-        return f"""
-            DONE! Got Valid Company Info.
-            The market cap of {self.company_info.name} is ${mkt_cap/1e9}B.
-            """
+        return ResultTool(
+            market_cap=mkt_cap,
+            info=self.company_info,
+            comment="success",  # arbitrary undeclared fields allowed
+        )
 
 
 # define agent, attach the tool
@@ -82,4 +87,17 @@ result = task.run(
     """
 )
 
-print(result.content)
+# note the result.tool_messages will be a list containing
+# an obj of type FinalResultTool, so we can extract fields from it.
+company_result = result.tool_messages[0]
+assert isinstance(company_result, ResultTool)
+assert isinstance(company_result.info, CompanyInfo)
+
+info = company_result.info
+mktcap = company_result.market_cap
+assert company_result.comment == "success"
+print(
+    f"""
+    Found company info: {info} and market cap: {mktcap}
+    """
+)

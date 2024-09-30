@@ -99,10 +99,12 @@ class PresidentTool(ToolMessage):
         ]
 
 
+@pytest.mark.parametrize("use_tools_api", [True, False])
 @pytest.mark.parametrize("use_functions_api", [True, False])
 def test_llm_structured_output_list(
     test_settings: Settings,
     use_functions_api: bool,
+    use_tools_api: bool,
 ):
     """
     Test whether LLM is able to GENERATE structured output.
@@ -111,27 +113,22 @@ def test_llm_structured_output_list(
     agent = ChatAgent(cfg)
     agent.config.use_functions_api = use_functions_api
     agent.config.use_tools = not use_functions_api
+    agent.config.use_tools_api = use_tools_api
     agent.enable_message(PresidentListTool)
     N = 3
     prompt = f"Show me examples of {N} Presidents of any set of countries you choose"
     llm_msg = agent.llm_response_forget(prompt)
-    tool_name = PresidentListTool.default_value("request")
-    if use_functions_api:
-        assert llm_msg.function_call is not None
-        assert llm_msg.function_call.name == tool_name
-    else:
-        tools = agent.get_tool_messages(llm_msg)
-        assert len(tools) == 1
-        assert isinstance(tools[0], PresidentListTool)
-
+    assert isinstance(agent.get_tool_messages(llm_msg)[0], PresidentListTool)
     agent_result = agent.agent_response(llm_msg)
     assert agent_result.content == str(N)
 
 
+@pytest.mark.parametrize("use_tools_api", [True, False])
 @pytest.mark.parametrize("use_functions_api", [True, False])
 def test_llm_structured_output_nested(
     test_settings: Settings,
     use_functions_api: bool,
+    use_tools_api: bool,
 ):
     """
     Test whether LLM is able to GENERATE nested structured output.
@@ -140,17 +137,10 @@ def test_llm_structured_output_nested(
     agent = ChatAgent(cfg)
     agent.config.use_functions_api = use_functions_api
     agent.config.use_tools = not use_functions_api
+    agent.config.use_tools_api = use_tools_api
     agent.enable_message(PresidentTool)
     country = "France"
     prompt = f"Show me an example of a President of {country}"
     llm_msg = agent.llm_response_forget(prompt)
-    tool_name = PresidentTool.default_value("request")
-    if use_functions_api:
-        assert llm_msg.function_call is not None
-        assert llm_msg.function_call.name == tool_name
-    else:
-        tools = agent.get_tool_messages(llm_msg)
-        assert len(tools) == 1
-        assert isinstance(tools[0], PresidentTool)
-
+    assert isinstance(agent.get_tool_messages(llm_msg)[0], PresidentTool)
     assert country == agent.agent_response(llm_msg).content
