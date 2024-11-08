@@ -6,6 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -33,14 +34,23 @@ def noop_fn(*args: List[Any], **kwargs: Dict[str, Any]) -> None:
     pass
 
 
+async def async_noop_fn(*args: List[Any], **kwargs: Dict[str, Any]) -> None:
+    pass
+
+
 FunctionCallTypes = Literal["none", "auto"]
 ToolChoiceTypes = Literal["none", "auto", "required"]
 ToolTypes = Literal["function"]
 
 
 class LLMConfig(BaseSettings):
+    """
+    Common configuration for all language models.
+    """
+
     type: str = "openai"
     streamer: Optional[Callable[[Any], None]] = noop_fn
+    streamer_async: Optional[Callable[..., Awaitable[None]]] = async_noop_fn
     api_base: str | None = None
     formatter: None | str = None
     timeout: int = 20  # timeout for API requests
@@ -48,6 +58,7 @@ class LLMConfig(BaseSettings):
     completion_model: str = ""
     temperature: float = 0.0
     chat_context_length: int = 8000
+    async_stream_quiet: bool = True  # suppress streaming output in async mode?
     completion_context_length: int = 8000
     max_output_tokens: int = 1024  # generate at most this many tokens
     # if input length + max_output_tokens > context length of model,
@@ -149,6 +160,10 @@ class OpenAIToolSpec(BaseModel):
 
 
 class LLMTokenUsage(BaseModel):
+    """
+    Usage of tokens by an LLM.
+    """
+
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost: float = 0.0
@@ -173,6 +188,10 @@ class LLMTokenUsage(BaseModel):
 
 
 class Role(str, Enum):
+    """
+    Possible roles for a message in a chat.
+    """
+
     USER = "user"
     SYSTEM = "system"
     ASSISTANT = "assistant"

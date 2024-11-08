@@ -32,6 +32,8 @@ from rich.prompt import Prompt
 
 from langroid.agent.chat_document import ChatDocMetaData, ChatDocument
 from langroid.agent.tool_message import ToolMessage
+from langroid.agent.xml_tool_message import XMLToolMessage
+from langroid.exceptions import XMLException
 from langroid.language_models.base import (
     LanguageModel,
     LLMConfig,
@@ -55,7 +57,13 @@ from langroid.pydantic_v1 import (
     validator,
 )
 from langroid.utils.configuration import settings
-from langroid.utils.constants import DONE, NO_ANSWER, PASS, PASS_TO, SEND_TO
+from langroid.utils.constants import (
+    DONE,
+    NO_ANSWER,
+    PASS,
+    PASS_TO,
+    SEND_TO,
+)
 from langroid.utils.object_registry import ObjectRegistry
 from langroid.utils.output import status
 from langroid.utils.types import from_string, to_string
@@ -84,6 +92,8 @@ class AgentConfig(BaseSettings):
     show_stats: bool = True  # show token usage/cost stats?
     add_to_registry: bool = True  # register agent in ObjectRegistry?
     respond_tools_only: bool = False  # respond only to tool messages (not plain text)?
+    # allow multiple tool messages in a single response?
+    allow_multiple_tools: bool = True
 
     @validator("name")
     def check_name_alphanum(cls, v: str) -> str:
@@ -96,6 +106,10 @@ class AgentConfig(BaseSettings):
 
 
 def noop_fn(*args: List[Any], **kwargs: Dict[str, Any]) -> None:
+    pass
+
+
+async def async_noop_fn(*args: List[Any], **kwargs: Dict[str, Any]) -> None:
     pass
 
 
@@ -145,6 +159,7 @@ class Agent(ABC):
 
         self.callbacks = SimpleNamespace(
             start_llm_stream=lambda: noop_fn,
+            start_llm_stream_async=async_noop_fn,
             cancel_llm_stream=noop_fn,
             finish_llm_stream=noop_fn,
             show_llm_response=noop_fn,
@@ -910,7 +925,7 @@ class Agent(ABC):
             return []
 
         if isinstance(msg, str):
-            json_tools = self.get_json_tool_messages(msg)
+            json_tools = self.get_formatted_tool_messages(msg)
             if all_tools:
                 return json_tools
             else:
@@ -938,7 +953,7 @@ class Agent(ABC):
             and msg.function_call is None
         ):
 
-            tools = self.get_json_tool_messages(msg.content)
+            tools = self.get_formatted_tool_messages(msg.content)
             msg.all_tool_messages = tools
             my_tools = [t for t in tools if self._tool_recipient_match(t)]
             msg.tool_messages = my_tools
@@ -966,9 +981,16 @@ class Agent(ABC):
         else:
             return my_tools
 
-    def get_json_tool_messages(self, input_str: str) -> List[ToolMessage]:
+    def get_formatted_tool_messages(self, input_str: str) -> List[ToolMessage]:
         """
-        Returns ToolMessage objects (tools) corresponding to JSON substrings, if any.
+        Returns ToolMessage objects (tools) corresponding to
+        tool-formatted substrings, if any.
+        ASSUMPTION - These tools are either ALL JSON-based, or ALL XML-based
+        (i.e. not a mix of both).
+        Terminology: a "formatted tool msg" is one which the LLM generates as
+            part of its raw string output, rather than within a JSON object
+            in the API response (i.e. this method does not extract tools/fns returned
+            by OpenAI's tools/fns API or similar APIs).
 
         Args:
             input_str (str): input string, typically a message sent by an LLM
@@ -976,10 +998,15 @@ class Agent(ABC):
         Returns:
             List[ToolMessage]: list of ToolMessage objects
         """
-        json_substrings = extract_top_level_json(input_str)
-        if len(json_substrings) == 0:
-            return []
-        results = [self._get_one_tool_message(j) for j in json_substrings]
+        substrings = XMLToolMessage.find_candidates(input_str)
+        is_json = False
+        if len(substrings) == 0:
+            substrings = extract_top_level_json(input_str)
+            is_json = len(substrings) > 0
+            if not is_json:
+                return []
+
+        results = [self._get_one_tool_message(j, is_json) for j in substrings]
         return [r for r in results if r is not None]
 
     def get_function_call_class(self, msg: ChatDocument) -> Optional[ToolMessage]:
@@ -1094,6 +1121,8 @@ class Agent(ABC):
         except ValidationError as ve:
             # correct tool name but bad fields
             return self.tool_validation_error(ve)
+        except XMLException as xe:  # from XMLToolMessage parsing
+            return str(xe)
         except ValueError:
             # invalid tool name
             # We return None since returning "invalid tool name" would
@@ -1101,6 +1130,8 @@ class Agent(ABC):
             # as a response to the tool message even though the tool was not intended
             # for this agent.
             return None
+        if len(tools) > 1 and not self.config.allow_multiple_tools:
+            return self.to_ChatDocument("ERROR: Use ONE tool at a time!")
         if len(tools) == 0:
             fallback_result = self.handle_message_fallback(msg)
             if fallback_result is None:
@@ -1200,17 +1231,29 @@ class Agent(ABC):
         """
         return None
 
-    def _get_one_tool_message(self, json_str: str) -> Optional[ToolMessage]:
+    def _get_one_tool_message(
+        self, tool_candidate_str: str, is_json: bool = True
+    ) -> Optional[ToolMessage]:
         """
-        Parse the json str into ANY ToolMessage KNOWN to agent --
+        Parse the tool_candidate_str into ANY ToolMessage KNOWN to agent --
         This includes non-used/handled tools, i.e. any tool in self.llm_tools_known.
         The exception to this is below where we try our best to infer the tool
-        when the LLM has "forgotten" to include the "request" field in the JSON --
+        when the LLM has "forgotten" to include the "request" field in the tool str ---
         in this case we ONLY look at the possible set of HANDLED tools, i.e.
         self.llm_tools_handled.
         """
-        json_data = json.loads(json_str)
-        # check if the json_data contains a "properties" field
+        if is_json:
+            maybe_tool_dict = json.loads(tool_candidate_str)
+        else:
+            try:
+                maybe_tool_dict = XMLToolMessage.extract_field_values(
+                    tool_candidate_str
+                )
+            except Exception as e:
+                from langroid.exceptions import XMLException
+
+                raise XMLException(f"Error extracting XML fields:\n {str(e)}")
+        # check if the maybe_tool_dict contains a "properties" field
         # which further contains the actual tool-call
         # (some weak LLMs do this). E.g. gpt-4o sometimes generates this:
         # TOOL: {
@@ -1225,17 +1268,17 @@ class Agent(ABC):
         #     ]
         # }
 
-        if not isinstance(json_data, dict):
+        if not isinstance(maybe_tool_dict, dict):
             return None
 
-        properties = json_data.get("properties")
+        properties = maybe_tool_dict.get("properties")
         if isinstance(properties, dict):
-            json_data = properties
-        request = json_data.get("request")
+            maybe_tool_dict = properties
+        request = maybe_tool_dict.get("request")
         if request is None:
             possible = [self.llm_tools_map[r] for r in self.llm_tools_handled]
             default_keys = set(ToolMessage.__fields__.keys())
-            request_keys = set(json_data.keys())
+            request_keys = set(maybe_tool_dict.keys())
 
             def maybe_parse(tool: type[ToolMessage]) -> Optional[ToolMessage]:
                 all_keys = set(tool.__fields__.keys())
@@ -1250,7 +1293,7 @@ class Agent(ABC):
                     return None
 
                 try:
-                    return tool.parse_obj(json_data)
+                    return tool.parse_obj(maybe_tool_dict)
                 except ValidationError:
                     return None
 
@@ -1277,7 +1320,7 @@ class Agent(ABC):
             return None
 
         try:
-            message = message_class.parse_obj(json_data)
+            message = message_class.parse_obj(maybe_tool_dict)
         except ValidationError as ve:
             raise ve
         return message
@@ -1292,7 +1335,7 @@ class Agent(ABC):
         """
         Convert result of a responder (agent_response or llm_response, or task.run()),
         or tool handler, or handle_message_fallback,
-        to a ChatDocument, to enabling handling by other
+        to a ChatDocument, to enable handling by other
         responders/tasks in a task loop possibly involving multiple agents.
 
         Args:

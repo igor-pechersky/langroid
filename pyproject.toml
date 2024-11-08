@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "langroid"
-version = "0.16.6"
+version = "0.19.5"
 description = "Harness LLMs with Multi-Agent Programming"
 authors = ["Prasad Chalasani <pchalasani@gmail.com>"]
 readme = "README.md"
@@ -87,8 +87,9 @@ nest-asyncio = "^1.6.0"
 async-generator = "^1.10"
 
 python-magic = "^0.4.27"
-json-repair = "^0.29.0"
+json-repair = "^0.29.9"
 cerebras-cloud-sdk = "^1.1.0"
+gitpython = "^3.1.43"
 
 
 [tool.poetry.extras]
@@ -162,6 +163,9 @@ pytest-asyncio = "^0.21.1"
 pytest-postgresql = "^5.0.0"
 pytest-mysql = "^2.4.2"
 coverage = "^7.2.5"
+pytest-xdist = "^3.6.1"
+pytest-timeout = "^2.3.1"
+pytest-cov = "^5.0.0"
 
 [tool.poetry.group.docs]
 optional = true
