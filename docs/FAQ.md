@@ -1,5 +1,24 @@
 # Frequently Asked Questions
 
+## Does Langroid work with non-OpenAI LLMs?
+
+Yes! Langroid works with practically any LLM, local or remote, closed or open.
+
+See these two guides:
+
+- [Using Langroid with local/open LLMs](https://langroid.github.io/langroid/tutorials/local-llm-setup/)
+- [Using Langroid with non-OpenAI proprietary LLMs](https://langroid.github.io/langroid/tutorials/non-openai-llms/)
+
+## Where can I find out about Langroid's architecture?
+
+There are a few documents that can help:
+
+- A work-in-progress [architecture description](https://langroid.github.io/langroid/blog/2024/08/15/overview-of-langroids-multi-agent-architecture-prelim/)
+  on the Langroid blog.
+- The Langroid [Getting Started](https://langroid.github.io/langroid/quick-start/) guide walks you 
+  step-by-step through Langroid's features and architecture.
+- An article by LanceDB on [Multi-Agent Programming with Langroid](https://lancedb.substack.com/p/langoid-multi-agent-programming-framework)
+
 ## How langroid handles long chat histories
 
 You may encounter an error like this:
@@ -46,6 +65,12 @@ use `ChatAgent._llm_response_temp_context`, which is used by default in the `Doc
 
 Another way to keep chat history tokens from growing too much is to use the `llm_response_forget` method, which 
 erases both the query and response, if that makes sense in your scenario.
+
+## How can I handle large results from Tools?
+
+As of version 0.22.0, Langroid allows you to control the size of tool results
+by setting [optional parameters](https://langroid.github.io/langroid/notes/large-tool-results/) 
+in a `ToolMessage` definition.
 
 ## Can I handle a tool without running a task?
 
@@ -154,3 +179,127 @@ The first two methods instruct the LLM to generate XML instead of JSON,
 and any field that is designated with a `verbatim=True` will be enclosed 
 within an XML `CDATA` tag, which does *not* require any escaping, and can
 be far more reliable for tool-use than JSON, especially with weak LLMs.
+
+## How can I handle an LLM "forgetting" to generate a `ToolMessage`? 
+
+Sometimes the LLM (especially a weak one) forgets to generate a 
+[`ToolMessage`][langroid.agent.tool_message.ToolMessage]
+(either via OpenAI's tools/functions API, or via Langroid's JSON/XML Tool mechanism),
+despite being instructed to do so. There are a few remedies Langroid offers for this:
+
+**Improve the instructions in the `ToolMessage` definition:**
+
+- Improve instructions in the `purpose` field of the `ToolMessage`.
+- Add an `instructions` class-method to the `ToolMessage`, as in the
+  [`chat-search.py`](https://github.com/langroid/langroid/blob/main/examples/docqa/chat-search.py) script:
+
+```python
+@classmethod
+def instructions(cls) -> str:
+    return """
+        IMPORTANT: You must include an ACTUAL query in the `query` field,
+        """
+```
+  These instructions are meant to be general instructions on how to use the tool
+  (e.g. how to set the field values), not to specifically about the formatting.
+
+- Add a `format_instructions` class-method, e.g. like the one in the 
+  [`chat-multi-extract-3.py`](https://github.com/langroid/langroid/blob/main/examples/docqa/chat-multi-extract-3.py) 
+  example script.
+
+```python
+@classmethod
+def format_instructions(cls, tool: bool = True) -> str:
+    instr = super().format_instructions(tool)
+    instr += """
+    ------------------------------
+    ASK ME QUESTIONS ONE BY ONE, to FILL IN THE FIELDS 
+    of the `lease_info` function/tool.
+    First ask me for the start date of the lease.
+    DO NOT ASK ANYTHING ELSE UNTIL YOU RECEIVE MY ANSWER.
+    """
+    return instr
+```
+
+**Override the `handle_message_fallback` method in the agent:**
+
+This method is called when the Agent's `agent_response` method receives a non-tool
+message as input. The default behavior of this method is to return None, but it
+is very useful to override the method to handle cases where the LLM has forgotten
+to use a tool. You can define this method to return a "nudge" to the LLM
+telling it that it forgot to do a tool-call, e.g. see how it's done in the 
+example script [`chat-multi-extract-local.py`](https://github.com/langroid/langroid/blob/main/examples/docqa/chat-multi-extract-local.py):
+
+```python
+class LeasePresenterAgent(ChatAgent):
+    def handle_message_fallback(
+        self, msg: str | ChatDocument
+    ) -> str | ChatDocument | None:
+        """Handle scenario where Agent failed to present the Lease JSON"""
+        if isinstance(msg, ChatDocument) and msg.metadata.sender == Entity.LLM:
+            return """
+            You either forgot to present the information in the JSON format
+            required in `lease_info` JSON specification,
+            or you may have used the wrong name of the tool or fields.
+            Try again.
+            """
+        return None
+```
+
+Note that despite doing all of these, the LLM may still fail to generate a `ToolMessage`.
+In such cases, you may want to consider using a better LLM, or an up-coming Langroid
+feature that leverages **strict decoding** abilities of specific LLM providers
+(e.g. OpenAI, llama.cpp, vllm) that are able to use grammar-constrained decoding
+to force the output to conform to the specified structure.
+
+## Can I use Langroid to converse with a Knowledge Graph (KG)?
+
+Yes, you can use Langroid to "chat with" either a Neo4j or ArangoDB KG, 
+see docs [here](https://langroid.github.io/langroid/notes/knowledge-graphs/)
+
+## How can I improve `DocChatAgent` (RAG) latency?
+
+The behavior of `DocChatAgent` can be controlled by a number of settings in 
+the `DocChatAgentConfig` class.
+The top-level query-answering method in `DocChatAgent` is `llm_response`, which use the 
+`answer_from_docs` method. At a high level, the response to an input message involves
+the following steps:
+
+- **Query to StandAlone:** LLM rephrases the query as a stand-alone query. 
+   This can incur some latency. You can 
+    turn it off by setting `assistant_mode=True` in the `DocChatAgentConfig`.
+- **Retrieval:** The most relevant passages (chunks) are retrieved using a collection of semantic/lexical 
+      similarity searches and ranking methods. There are various knobs in `DocChatAgentConfig` to control
+      this retrieval.
+- **Relevance Extraction:** LLM is used to retrieve verbatim relevant portions from
+  the retrieved chunks. This is typically the biggest latency step. You can turn it off
+  by setting the `relevance_extractor_config` to None in `DocChatAgentConfig`.
+- **Answer Generation:** LLM generates answer based on retrieved passages.
+
+
+See the [`doc-aware-chat.py`](https://github.com/langroid/langroid/blob/main/examples/docqa/doc-aware-chat.py)
+example script, which illustrates some of these settings.
+
+In some scenarios you want to *only* use the **retrieval** step of a `DocChatAgent`.
+For this you can use the [`RetrievalTool`][langroid.agent.tools.retrieval_tool.RetrievalTool].
+See the `test_retrieval_tool` in 
+[`test_doc_chat_agent.py`](https://github.com/langroid/langroid/blob/main/tests/main/test_doc_chat_agent.py).
+to learn how to use it. The above example script uses `RetrievalTool` as well.
+
+## Is there support to run multiple tasks concurrently?
+
+Yes, see the `run_batch_tasks` and related functions in 
+[batch.py](https://github.com/langroid/langroid/blob/main/langroid/agent/batch.py).
+
+See also:
+
+- tests: [test_batch.py](https://github.com/langroid/langroid/blob/main/tests/main/test_batch.py),
+   [test_relevance_extractor.py](https://github.com/langroid/langroid/blob/main/tests/main/test_relevance_extractor.py),
+- example: [multi-agent-round-table.py](https://github.com/langroid/langroid/blob/main/examples/basic/multi-agent-round-table.py)
+
+Another example is within 
+[`DocChatAgent`](https://github.com/langroid/langroid/blob/main/langroid/agent/special/doc_chat_agent.py), 
+which uses batch tasks for relevance extraction,
+see the `get_verbatim_extracts` method -- when there are k relevant passages,
+this runs k tasks concurrently, 
+each of which uses an LLM-agent to extract relevant verbatim text from a passage.

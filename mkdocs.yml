@@ -103,6 +103,10 @@ nav:
       - Overview: notes/overview.md
       - XML-based Tools: notes/xml-tools.md
       - Async Streaming: notes/async-streaming.md
+      - Knowledge Graphs: notes/knowledge-graphs.md
+      - Gemini LLMs: notes/gemini.md
+      - Large Tool Results: notes/large-tool-results.md
+      - GLHF.chat Support: notes/glhf-chat.md
 
   - Examples:
     - Guide: examples/guide.md

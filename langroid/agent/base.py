@@ -94,6 +94,9 @@ class AgentConfig(BaseSettings):
     respond_tools_only: bool = False  # respond only to tool messages (not plain text)?
     # allow multiple tool messages in a single response?
     allow_multiple_tools: bool = True
+    human_prompt: str = (
+        "Human (respond or q, x to exit current level, " "or hit enter to continue)"
+    )
 
     @validator("name")
     def check_name_alphanum(cls, v: str) -> str:
@@ -139,7 +142,7 @@ class Agent(ABC):
         self.llm_tools_handled: Set[str] = set()
         self.llm_tools_usable: Set[str] = set()
         self.llm_tools_known: Set[str] = set()  # all known tools, handled/used or not
-        self.interactive: bool | None = None
+        self.interactive: bool = True  # may be modified by Task wrapper
         self.token_stats_str = ""
         self.default_human_response: Optional[str] = None
         self._indent = ""
@@ -411,16 +414,13 @@ class Agent(ABC):
         results = self.handle_message(msg)
         if results is None:
             return None
-        if isinstance(results, ChatDocument):
-            # Preserve trail of tool_ids for OpenAI Assistant fn-calls
-            results.metadata.tool_ids = (
-                [] if isinstance(msg, str) else msg.metadata.tool_ids
-            )
-            return results
         if not settings.quiet:
-            results_str = (
-                results if isinstance(results, str) else json.dumps(results, indent=2)
-            )
+            if isinstance(results, str):
+                results_str = results
+            elif isinstance(results, ChatDocument):
+                results_str = results.content
+            elif isinstance(results, dict):
+                results_str = json.dumps(results, indent=2)
             console.print(f"[red]{self.indent}", end="")
             print(f"[red]Agent: {escape(results_str)}")
             maybe_json = len(extract_top_level_json(results_str)) > 0
@@ -428,6 +428,12 @@ class Agent(ABC):
                 content=results_str,
                 language="json" if maybe_json else "text",
             )
+        if isinstance(results, ChatDocument):
+            # Preserve trail of tool_ids for OpenAI Assistant fn-calls
+            results.metadata.tool_ids = (
+                [] if isinstance(msg, str) else msg.metadata.tool_ids
+            )
+            return results
         sender_name = self.config.name
         if isinstance(msg, ChatDocument) and msg.function_call is not None:
             # if result was from handling an LLM `function_call`,
@@ -639,10 +645,11 @@ class Agent(ABC):
         need_human_response = (
             isinstance(msg, ChatDocument) and msg.metadata.recipient == Entity.USER
         )
+        default_user_msg = (
+            (self.default_human_response or "null") if need_human_response else ""
+        )
 
-        interactive = self.interactive or settings.interactive
-
-        if not interactive and not need_human_response:
+        if not self.interactive and not need_human_response:
             return None
         elif self.default_human_response is not None:
             user_msg = self.default_human_response
@@ -655,20 +662,22 @@ class Agent(ABC):
                 user_msg = self.callbacks.get_user_response(prompt="")
             else:
                 user_msg = Prompt.ask(
-                    f"[blue]{self.indent}Human "
-                    "(respond or q, x to exit current level, "
-                    f"or hit enter to continue)\n{self.indent}",
+                    f"[blue]{self.indent}"
+                    + self.config.human_prompt
+                    + f"\n{self.indent}"
                 ).strip()
 
         tool_ids = []
         if msg is not None and isinstance(msg, ChatDocument):
             tool_ids = msg.metadata.tool_ids
+
+        user_msg = user_msg.strip() or default_user_msg.strip()
         # only return non-None result if user_msg not empty
         if not user_msg:
             return None
         else:
             if user_msg.startswith("SYSTEM"):
-                user_msg = user_msg[6:].strip()
+                user_msg = user_msg.replace("SYSTEM", "").strip()
                 source = Entity.SYSTEM
                 sender = Entity.SYSTEM
             else:
@@ -697,7 +706,7 @@ class Agent(ABC):
         if self.llm is None:
             return False
 
-        if message is not None and len(self.get_tool_messages(message)) > 0:
+        if message is not None and len(self.try_get_tool_messages(message)) > 0:
             # if there is a valid "tool" message (either JSON or via `function_call`)
             # then LLM cannot respond to it
             return False
@@ -711,7 +720,7 @@ class Agent(ABC):
         Args:
             message (str|ChatDocument): message or ChatDocument object to respond to.
         """
-        tools = self.get_tool_messages(message)
+        tools = self.try_get_tool_messages(message)
         if len(tools) == 0 and self.config.respond_tools_only:
             return False
         if message is not None and self.has_only_unhandled_tools(message):
@@ -747,18 +756,18 @@ class Agent(ABC):
     @no_type_check
     async def llm_response_async(
         self,
-        msg: Optional[str | ChatDocument] = None,
+        message: Optional[str | ChatDocument] = None,
     ) -> Optional[ChatDocument]:
         """
         Asynch version of `llm_response`. See there for details.
         """
-        if msg is None or not self.llm_can_respond(msg):
+        if message is None or not self.llm_can_respond(message):
             return None
 
-        if isinstance(msg, ChatDocument):
-            prompt = msg.content
+        if isinstance(message, ChatDocument):
+            prompt = message.content
         else:
-            prompt = msg
+            prompt = message
 
         output_len = self.config.llm.max_output_tokens
         if self.num_tokens(prompt) + output_len > self.llm.completion_context_length():
@@ -798,29 +807,31 @@ class Agent(ABC):
             )
         cdoc = ChatDocument.from_LLMResponse(response, displayed=True)
         # Preserve trail of tool_ids for OpenAI Assistant fn-calls
-        cdoc.metadata.tool_ids = [] if isinstance(msg, str) else msg.metadata.tool_ids
+        cdoc.metadata.tool_ids = (
+            [] if isinstance(message, str) else message.metadata.tool_ids
+        )
         return cdoc
 
     @no_type_check
     def llm_response(
         self,
-        msg: Optional[str | ChatDocument] = None,
+        message: Optional[str | ChatDocument] = None,
     ) -> Optional[ChatDocument]:
         """
         LLM response to a prompt.
         Args:
-            msg (str|ChatDocument): prompt string, or ChatDocument object
+            message (str|ChatDocument): prompt string, or ChatDocument object
 
         Returns:
             Response from LLM, packaged as a ChatDocument
         """
-        if msg is None or not self.llm_can_respond(msg):
+        if message is None or not self.llm_can_respond(message):
             return None
 
-        if isinstance(msg, ChatDocument):
-            prompt = msg.content
+        if isinstance(message, ChatDocument):
+            prompt = message.content
         else:
-            prompt = msg
+            prompt = message
 
         with ExitStack() as stack:  # for conditionally using rich spinner
             if not self.llm.get_stream():
@@ -870,11 +881,19 @@ class Agent(ABC):
         )
         cdoc = ChatDocument.from_LLMResponse(response, displayed=True)
         # Preserve trail of tool_ids for OpenAI Assistant fn-calls
-        cdoc.metadata.tool_ids = [] if isinstance(msg, str) else msg.metadata.tool_ids
+        cdoc.metadata.tool_ids = (
+            [] if isinstance(message, str) else message.metadata.tool_ids
+        )
         return cdoc
 
     def has_tool_message_attempt(self, msg: str | ChatDocument | None) -> bool:
-        """Check whether msg contains a Tool/fn-call attempt (by the LLM)"""
+        """
+        Check whether msg contains a Tool/fn-call attempt (by the LLM).
+
+        CAUTION: This uses self.get_tool_messages(msg) which as a side-effect
+        may update msg.tool_messages when msg is a ChatDocument, if there are
+        any tools in msg.
+        """
         if msg is None:
             return False
         try:
@@ -903,10 +922,20 @@ class Agent(ABC):
         """
         if msg is None:
             return False
-        tools = self.get_tool_messages(msg, all_tools=True)
+        tools = self.try_get_tool_messages(msg, all_tools=True)
         if len(tools) == 0:
             return False
         return all(not self._tool_recipient_match(t) for t in tools)
+
+    def try_get_tool_messages(
+        self,
+        msg: str | ChatDocument | None,
+        all_tools: bool = False,
+    ) -> List[ToolMessage]:
+        try:
+            return self.get_tool_messages(msg, all_tools)
+        except ValidationError:
+            return []
 
     def get_tool_messages(
         self,
@@ -915,10 +944,22 @@ class Agent(ABC):
     ) -> List[ToolMessage]:
         """
         Get ToolMessages recognized in msg, handle-able by this agent.
-        If all_tools is True:
-        - return all tools, i.e. any tool in self.llm_tools_known,
-            whether it is handled by this agent or not;
-        - otherwise, return only the tools handled by this agent.
+        NOTE: as a side-effect, this will update msg.tool_messages
+        when msg is a ChatDocument and msg contains tool messages.
+        The intent here is that update=True should be set ONLY within agent_response()
+        or agent_response_async() methods. In other words, we want to persist the
+        msg.tool_messages only AFTER the agent has had a chance to handle the tools.
+
+        Args:
+            msg (str|ChatDocument): the message to extract tools from.
+            all_tools (bool):
+                - if True, return all tools,
+                    i.e. any recognized tool in self.llm_tools_known,
+                    whether it is handled by this agent or not;
+                - otherwise, return only the tools handled by this agent.
+
+        Returns:
+            List[ToolMessage]: list of ToolMessage objects
         """
 
         if msg is None:
@@ -955,6 +996,7 @@ class Agent(ABC):
 
             tools = self.get_formatted_tool_messages(msg.content)
             msg.all_tool_messages = tools
+            # filter for actually handle-able tools, and recipient is this agent
             my_tools = [t for t in tools if self._tool_recipient_match(t)]
             msg.tool_messages = my_tools
 
@@ -1402,7 +1444,7 @@ class Agent(ABC):
         if content_any is not None and isinstance(content_any, output_type):
             return cast(T, content_any)
 
-        tools = self.get_tool_messages(msg, all_tools=True)
+        tools = self.try_get_tool_messages(msg, all_tools=True)
 
         if get_origin(output_type) is list:
             list_element_type = get_args(output_type)[0]
@@ -1434,6 +1476,40 @@ class Agent(ABC):
                 return cast(T, value)
 
         return None
+
+    def _maybe_truncate_result(
+        self, result: str | ChatDocument | None, max_tokens: int | None
+    ) -> str | ChatDocument | None:
+        """
+        Truncate the result string to `max_tokens` tokens.
+        """
+        if result is None or max_tokens is None:
+            return result
+        result_str = result.content if isinstance(result, ChatDocument) else result
+        num_tokens = (
+            self.parser.num_tokens(result_str)
+            if self.parser is not None
+            else len(result_str) / 4.0
+        )
+        if num_tokens <= max_tokens:
+            return result
+        truncate_warning = f"""
+        The TOOL result was large, so it was truncated to {max_tokens} tokens.
+        To get the full result, the TOOL must be called again.
+        """
+        if isinstance(result, str):
+            return (
+                self.parser.truncate_tokens(result, max_tokens)
+                if self.parser is not None
+                else result[: max_tokens * 4]  # approx truncate
+            ) + truncate_warning
+        elif isinstance(result, ChatDocument):
+            result.content = (
+                self.parser.truncate_tokens(result.content, max_tokens)
+                if self.parser is not None
+                else result.content[: max_tokens * 4]  # approx truncate
+            ) + truncate_warning
+            return result
 
     def handle_tool_message(
         self,
@@ -1470,7 +1546,9 @@ class Agent(ABC):
             # not a pydantic validation error,
             # which we check in `handle_message`
             raise e
-        return result  # type: ignore
+        return self._maybe_truncate_result(
+            result, tool._max_result_tokens
+        )  # type: ignore
 
     def num_tokens(self, prompt: str | List[LLMMessage]) -> int:
         if self.parser is None:

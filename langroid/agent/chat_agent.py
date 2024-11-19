@@ -623,6 +623,45 @@ class ChatAgent(Agent):
             self.llm_tools_usable.discard(r)
             self.llm_functions_usable.discard(r)
 
+    def truncate_message(
+        self,
+        idx: int,
+        tokens: int = 5,
+        warning: str = "...[Contents truncated!]",
+    ) -> LLMMessage:
+        """Truncate message at idx in msg history to `tokens` tokens"""
+        llm_msg = self.message_history[idx]
+        orig_content = llm_msg.content
+        new_content = (
+            self.parser.truncate_tokens(orig_content, tokens)
+            if self.parser is not None
+            else orig_content[: tokens * 4]  # approx truncation
+        )
+        llm_msg.content = new_content + "\n" + warning
+        return llm_msg
+
+    def _reduce_raw_tool_results(self, message: ChatDocument) -> None:
+        """
+        If message is the result of a ToolMessage that had
+        a `_max_retained_tokens` set to a non-None value, then we replace contents
+        with a placeholder message.
+        """
+        parent_message: ChatDocument | None = message.parent
+        tools = [] if parent_message is None else parent_message.tool_messages
+        truncate_tools = [t for t in tools if t._max_retained_tokens is not None]
+        limiting_tool = truncate_tools[0] if len(truncate_tools) > 0 else None
+        if limiting_tool is not None and limiting_tool._max_retained_tokens is not None:
+            tool_name = limiting_tool.default_value("request")
+            max_tokens: int = limiting_tool._max_retained_tokens
+            truncation_warning = f"""
+                The result of the {tool_name} tool were too large, 
+                and has been truncated to {max_tokens} tokens.
+                To obtain the full result, the tool needs to be re-used.
+            """
+            self.truncate_message(
+                message.metadata.msg_idx, max_tokens, truncation_warning
+            )
+
     def llm_response(
         self, message: Optional[str | ChatDocument] = None
     ) -> Optional[ChatDocument]:
@@ -650,6 +689,8 @@ class ChatAgent(Agent):
         self.message_history.extend(ChatDocument.to_LLMMessage(response))
         response.metadata.msg_idx = len(self.message_history) - 1
         response.metadata.agent_id = self.id
+        if isinstance(message, ChatDocument):
+            self._reduce_raw_tool_results(message)
         # Preserve trail of tool_ids for OpenAI Assistant fn-calls
         response.metadata.tool_ids = (
             []
@@ -681,6 +722,8 @@ class ChatAgent(Agent):
         self.message_history.extend(ChatDocument.to_LLMMessage(response))
         response.metadata.msg_idx = len(self.message_history) - 1
         response.metadata.agent_id = self.id
+        if isinstance(message, ChatDocument):
+            self._reduce_raw_tool_results(message)
         # Preserve trail of tool_ids for OpenAI Assistant fn-calls
         response.metadata.tool_ids = (
             []
