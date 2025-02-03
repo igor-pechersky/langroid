@@ -9,13 +9,23 @@ from langroid.agent.chat_agent import ChatAgent, ChatAgentConfig
 from langroid.agent.chat_document import ChatDocMetaData, ChatDocument
 from langroid.agent.task import Task
 from langroid.agent.tool_message import ToolMessage
-from langroid.agent.tools import DoneTool
+from langroid.agent.tools import DonePassTool, DoneTool
 from langroid.agent.tools.orchestration import (
     AgentDoneTool,
     FinalResultTool,
     ResultTool,
 )
+from langroid.agent.xml_tool_message import XMLToolMessage
 from langroid.cachedb.redis_cachedb import RedisCacheConfig
+from langroid.language_models.base import (
+    LLMFunctionCall,
+    LLMFunctionSpec,
+    LLMMessage,
+    OpenAIJsonSchemaSpec,
+    OpenAIToolCall,
+    OpenAIToolSpec,
+    Role,
+)
 from langroid.language_models.mock_lm import MockLMConfig
 from langroid.language_models.openai_gpt import OpenAIGPTConfig
 from langroid.mytypes import Entity
@@ -47,19 +57,24 @@ class CountryCapitalMessage(ToolMessage):
 
 class FileExistsMessage(ToolMessage):
     request: str = "file_exists"
-    purpose: str = "To check whether a certain <filename> is in the repo."
+    purpose: str = """
+    To check whether a certain <filename> is in the repo,
+    recursively if needed, as specified by <recurse>.
+    """
     filename: str = Field(..., description="File name to check existence of")
+    recurse: bool = Field(..., description="Whether to recurse into subdirectories")
 
     @classmethod
     def examples(cls) -> List["FileExistsMessage"]:
         return [
-            cls(filename="README.md"),
-            cls(filename="Dockerfile"),
+            cls(filename="README.md", recurse=True),
+            cls(filename="Dockerfile", recurse=False),
         ]
 
 
 class PythonVersionMessage(ToolMessage):
     request: str = "python_version"
+    _handler: str = "tool_handler"
     purpose: str = "To check which version of Python is needed."
 
     @classmethod
@@ -76,8 +91,11 @@ class MessageHandlingAgent(ChatAgent):
     def file_exists(self, message: FileExistsMessage) -> str:
         return "yes" if message.filename == "requirements.txt" else "no"
 
-    def python_version(self, PythonVersionMessage) -> str:
-        return DEFAULT_PY_VERSION
+    def tool_handler(self, message: ToolMessage) -> str:
+        if message.request == "python_version":
+            return DEFAULT_PY_VERSION
+        else:
+            return "invalid tool name"
 
     def country_capital(self, message: CountryCapitalMessage) -> str:
         return (
@@ -193,7 +211,8 @@ FILE_EXISTS_MSG = """
 Ok, thank you.
 {
 "request": "file_exists",
-"filename": "test.txt"
+"filename": "test.txt",
+"recurse": true
 }
 Hope you can tell me!
 """
@@ -255,17 +274,24 @@ def test_handle_bad_tool_message():
     assert "file_exists" in result and "filename" in result and "required" in result
 
 
-@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize("stream", [False, True])
 @pytest.mark.parametrize(
     "use_functions_api",
-    [False],
+    [True, False],
+)
+@pytest.mark.parametrize(
+    "use_tools_api",
+    [True, False],
 )
 @pytest.mark.parametrize(
     "message_class, prompt, result",
     [
         (
             FileExistsMessage,
-            "You have to find out whether the file 'requirements.txt' exists",
+            """
+            You have to find out whether the file 'requirements.txt' exists in the repo,
+            recursively exploring subdirectories if needed.
+            """,
             "yes",
         ),
         (
@@ -283,6 +309,7 @@ def test_handle_bad_tool_message():
 def test_llm_tool_message(
     test_settings: Settings,
     use_functions_api: bool,
+    use_tools_api: bool,
     message_class: ToolMessage,
     prompt: str,
     result: str,
@@ -304,6 +331,7 @@ def test_llm_tool_message(
     agent = MessageHandlingAgent(cfg)
     agent.config.use_functions_api = use_functions_api
     agent.config.use_tools = not use_functions_api
+    agent.config.use_tools_api = use_tools_api
     if not agent.llm.is_openai_chat_model() and use_functions_api:
         pytest.skip(
             f"""
@@ -322,7 +350,10 @@ def test_llm_tool_message(
     llm_msg = agent.llm_response_forget(prompt)
     tool_name = message_class.default_value("request")
     if use_functions_api:
-        assert llm_msg.oai_tool_calls[0].function.name == tool_name
+        if use_tools_api:
+            assert llm_msg.oai_tool_calls[0].function.name == tool_name
+        else:
+            assert llm_msg.function_call.name == tool_name
 
     tools = agent.get_tool_messages(llm_msg)
     assert len(tools) == 1
@@ -362,13 +393,13 @@ class CoriolisTool(ToolMessage):
     """Tool for testing handling of optional arguments, with default values."""
 
     request: str = "coriolis"
-    purpose: str = "to request computing the Coriolis transform of <x> and <y>"
-    x: int
-    y: int = 5
+    purpose: str = "to request computing the Coriolis transform of <cats> and <cows>"
+    cats: int
+    cows: int = 5
 
     def handle(self) -> str:
         # same as NabroskiTool result
-        return str(3 * self.x + self.y)
+        return str(3 * self.cats + self.cows)
 
 
 wrong_nabroski_tool = """
@@ -401,13 +432,27 @@ def test_agent_malformed_tool(
     assert "num_pair" in response.content and "yval" in response.content
 
 
+class FruitPair(BaseModel):
+    pears: int
+    apples: int
+
+
 class EulerTool(ToolMessage):
     request: str = "euler"
-    purpose: str = "to request computing the Euler transform of <num_pair>"
-    num_pair: NumPair
+    purpose: str = "to request computing the Euler transform of <fruit_pair>"
+    fruit_pair: FruitPair
 
     def handle(self) -> str:
-        return str(2 * self.num_pair.xval - self.num_pair.yval)
+        return str(2 * self.fruit_pair.pears - self.fruit_pair.apples)
+
+
+class BoilerTool(ToolMessage):
+    request: str = "boiler"
+    purpose: str = "to request computing the Boiler transform of <fruit_pair>"
+    fruit_pair: FruitPair
+
+    def handle(self) -> str:
+        return str(3 * self.fruit_pair.pears - 5 * self.fruit_pair.apples)
 
 
 class SumTool(ToolMessage):
@@ -448,8 +493,8 @@ def test_agent_infer_tool(
 ):
     set_global(test_settings)
     gauss_request = """{"xval": 1, "yval": 3}"""
-    nabrowski_or_euler_request = """{"num_pair": {"xval": 1, "yval": 3}}"""
-    euler_request = """{"request": "euler", "num_pair": {"xval": 1, "yval": 3}}"""
+    boiler_or_euler_request = """{"fruit_pair": {"pears": 1, "apples": 3}}"""
+    euler_request = """{"request": "euler", "fruit_pair": {"pears": 1, "apples": 3}}"""
     additional_args_request = """{"xval": 1, "yval": 3, "zval": 4}"""
     additional_args_request_specified = """
     {"request": "gauss", "xval": 1, "yval": 3, "zval": 4}
@@ -468,15 +513,17 @@ def test_agent_infer_tool(
             NabroskiTool,
             GaussTool,
             CoinFlipTool,
+            BoilerTool,
         ]
     )
     agent.enable_message(EulerTool, handle=False)
 
-    # Nabrowski is the only option prior to enabling EulerTool handling
-    assert agent.agent_response(nabrowski_or_euler_request).content == "6"
+    # Boiler is the only option prior to enabling EulerTool handling
+    assert agent.agent_response(boiler_or_euler_request).content == "-12"
 
     # Enable handling EulerTool, this makes nabrowski_or_euler_request ambiguous
     agent.enable_message(EulerTool)
+    agent.enable_message(BoilerTool)
 
     # Gauss is the only option
     assert agent.agent_response(gauss_request).content == "12"
@@ -485,7 +532,7 @@ def test_agent_infer_tool(
     assert agent.agent_response(euler_request).content == "-1"
 
     # We cannot infer the correct tool if there exist multiple matches
-    assert agent.agent_response(nabrowski_or_euler_request) is None
+    assert agent.agent_response(boiler_or_euler_request) is None
 
     # We do not infer tools where the request has additional arguments
     assert agent.agent_response(additional_args_request) is None
@@ -567,7 +614,7 @@ def test_tool_optional_args(
     response = agent.llm_response("What is the Coriolis transform of 1, 2?")
     assert isinstance(agent.get_tool_messages(response)[0], CoriolisTool)
     tool = agent.get_tool_messages(response)[0]
-    assert tool.x == 1 and tool.y == 2
+    assert tool.cats == 1 and tool.cows == 2
 
 
 @pytest.mark.parametrize("tool", [NabroskiTool, CoriolisTool])
@@ -1068,6 +1115,26 @@ def test_llm_end_with_tool(
         assert tool.pair.a == 1 and tool.pair.b == 2
 
 
+def test_final_result_tool():
+    """Test that FinalResultTool can be returned by agent_response"""
+
+    class MyAgent(ChatAgent):
+        def agent_response(self, msg: str | ChatDocument) -> Any:
+            return FinalResultTool(answer="42")
+
+    agent = MyAgent(
+        ChatAgentConfig(
+            name="MyAgent",
+            llm=MockLMConfig(response_fn=lambda x: x),
+        )
+    )
+
+    task = Task(agent, interactive=False)[ToolMessage]
+    result = task.run("3")
+    assert isinstance(result, FinalResultTool)
+    assert result.answer == "42"
+
+
 @pytest.mark.parametrize("tool", ["none", "a", "aa", "b"])
 def test_agent_respond_only_tools(tool: str):
     """
@@ -1187,6 +1254,445 @@ def test_agent_respond_only_tools(tool: str):
             assert bob_task.n_stalled_steps == 0
 
 
+@pytest.mark.parametrize("use_fn_api", [True, False])
+@pytest.mark.parametrize("use_tools_api", [True, False])
+def test_structured_recovery(
+    test_settings: Settings,
+    use_fn_api: bool,
+    use_tools_api: bool,
+):
+    """
+    Test that structured fallback correctly recovers
+    from failed tool calls.
+    """
+    set_global(test_settings)
+
+    def simulate_failed_call(attempt: str | ChatDocument) -> str:
+        agent = ChatAgent(
+            ChatAgentConfig(
+                use_functions_api=use_fn_api,
+                use_tools_api=use_tools_api,
+                use_tools=not use_fn_api,
+                strict_recovery=True,
+                llm=OpenAIGPTConfig(
+                    supports_json_schema=True,
+                    supports_strict_tools=True,
+                ),
+            )
+        )
+        agent.enable_message(NabroskiTool)
+        agent.enable_message(CoriolisTool)
+        agent.enable_message(EulerTool)
+
+        agent.message_history = [
+            LLMMessage(
+                role=Role.SYSTEM,
+                content="You are a helpful assistant.",
+            ),
+            LLMMessage(
+                role=Role.USER,
+                content="""
+                Please give me an example of a Nabroski, Coriolis, or Euler call.
+                """,
+            ),
+            LLMMessage(
+                role=Role.ASSISTANT,
+                content=attempt if isinstance(attempt, str) else attempt.content,
+                tool_calls=None if isinstance(attempt, str) else attempt.oai_tool_calls,
+                function_call=(
+                    None if isinstance(attempt, str) else attempt.function_call
+                ),
+            ),
+        ]
+        if (
+            use_fn_api
+            and use_tools_api
+            and isinstance(attempt, ChatDocument)
+            and attempt.oai_tool_calls is not None
+        ):
+            # Inserting this since OpenAI API strictly requires a
+            # Role.TOOL msg immediately after an Assistant Tool call,
+            # before the next Assistant msg.
+            agent.message_history.extend(
+                [
+                    LLMMessage(
+                        role=Role.TOOL,
+                        tool_call_id=t.id,
+                        content="error",
+                    )
+                    for t in attempt.oai_tool_calls
+                ]
+            )
+
+        # Simulates bad tool attempt by the LLM
+        agent.handle_message(attempt)
+        assert agent.tool_error
+        response = agent.llm_response(
+            """
+            There was an error in your attempted tool/function call. Please correct it.
+            """
+        )
+        assert response is not None
+        result = agent.handle_message(response)
+        assert result is not None
+        if isinstance(result, ChatDocument):
+            return result.content
+
+        return result
+
+    def to_attempt(attempt: LLMFunctionCall) -> str | ChatDocument:
+        if not use_fn_api:
+            return json.dumps(
+                {
+                    "request": attempt.name,
+                    **(attempt.arguments or {}),
+                }
+            )
+
+        if use_tools_api:
+            return ChatDocument(
+                content="",
+                metadata=ChatDocMetaData(sender=Entity.LLM),
+                oai_tool_calls=[
+                    OpenAIToolCall(
+                        id="call-1234657",
+                        function=attempt,
+                    )
+                ],
+            )
+
+        return ChatDocument(
+            content="",
+            metadata=ChatDocMetaData(sender=Entity.LLM),
+            function_call=attempt,
+        )
+
+    # The name of the function is incorrect:
+    # The LLM should correct the request to "nabroski" in recovery
+    assert (
+        simulate_failed_call(
+            to_attempt(
+                LLMFunctionCall(
+                    name="__nabroski__",
+                    arguments={
+                        "xval": 1,
+                        "yval": 3,
+                    },
+                )
+            )
+        )
+        == "6"
+    )
+    # The LLM should correct the request to "nabroski" in recovery
+    assert (
+        simulate_failed_call(
+            to_attempt(
+                LLMFunctionCall(
+                    name="Nabroski-function",
+                    arguments={
+                        "xval": 2,
+                        "yval": 3,
+                    },
+                )
+            )
+        )
+        == "9"
+    )
+    # Strict fallback disables the default arguments, but the LLM
+    # should infer from context. In addition, the name of the
+    # function is incorrect (the LLM should infer "coriolis" in
+    # recovery) and the JSON output is malformed
+
+    # Note here we intentionally use "catss" as the arg to ensure that
+    # the tool-name inference doesn't work (see `maybe_parse` agent/base.py,
+    # there's a mechanism that infers the intended tool if the arguments are
+    # unambiguously for a specific tool) -- here since we use `catss` that
+    # mechanism fails, and we can do this test properly to focus on structured
+    # recovery. But `catss' is sufficiently similar to 'cats' that the
+    # intent-based recovery should work.
+    assert (
+        simulate_failed_call(
+            """
+        request ":coriolis"
+        arguments {"catss": 1} 
+        """
+        )
+        == "8"
+    )
+    # The LLM should correct the request to "coriolis" in recovery
+    # The LLM should infer the default argument from context
+    assert (
+        simulate_failed_call(
+            to_attempt(
+                LLMFunctionCall(
+                    name="Coriolis",
+                    arguments={
+                        "cats": 1,
+                    },
+                )
+            )
+        )
+        == "8"
+    )
+    # The LLM should infer "euler" in recovery
+    assert (
+        simulate_failed_call(
+            to_attempt(
+                LLMFunctionCall(
+                    name="EulerTool",
+                    arguments={
+                        "pears": 6,
+                        "apples": 4,
+                    },
+                )
+            )
+        )
+        == "8"
+    )
+
+
+@pytest.mark.parametrize("use_fn_api", [True, False])
+@pytest.mark.parametrize("use_tools_api", [True, False])
+@pytest.mark.parametrize("parallel_tool_calls", [True, False])
+def test_strict_fallback(
+    test_settings: Settings,
+    use_fn_api: bool,
+    use_tools_api: bool,
+    parallel_tool_calls: bool,
+):
+    """
+    Test that strict tool and structured output errors
+    are handled gracefully and are disabled if errors
+    are caused.
+    """
+    set_global(test_settings)
+
+    class BrokenStrictSchemaAgent(ChatAgent):
+        def _function_args(self) -> tuple[
+            Optional[List[LLMFunctionSpec]],
+            str | dict[str, str],
+            Optional[list[OpenAIToolSpec]],
+            Optional[dict[str, dict[str, str] | str]],
+            Optional[OpenAIJsonSchemaSpec],
+        ]:
+            """
+            Implements a broken version of the correct _function_args()
+            that ensures that the generated schemas are incompatible
+            with OpenAI's strict decoding implementation.
+
+            Specifically, removes the schema edits performed by
+            `format_schema_for_strict()` (e.g. setting "additionalProperties"
+            to False on all objects in the JSON schema).
+            """
+            functions, fun_call, tools, force_tool, output_format = (
+                super()._function_args()
+            )
+
+            # remove schema edits for strict
+            if tools is not None:
+                for t in tools:
+                    name = t.function.name
+                    t.function = self.llm_functions_map[name]
+
+            if self.output_format is not None and self._json_schema_available():
+                self.any_strict = True
+                if issubclass(self.output_format, ToolMessage) and not issubclass(
+                    self.output_format, XMLToolMessage
+                ):
+                    spec = self.output_format.llm_function_schema(
+                        request=True,
+                        defaults=self.config.output_format_include_defaults,
+                    )
+
+                    output_format = OpenAIJsonSchemaSpec(
+                        strict=True,
+                        function=spec,
+                    )
+                elif issubclass(self.output_format, BaseModel):
+                    param_spec = self.output_format.schema()
+
+                    output_format = OpenAIJsonSchemaSpec(
+                        strict=True,
+                        function=LLMFunctionSpec(
+                            name="json_output",
+                            description="Strict Json output format.",
+                            parameters=param_spec,
+                        ),
+                    )
+
+            return functions, fun_call, tools, force_tool, output_format
+
+    agent = BrokenStrictSchemaAgent(
+        ChatAgentConfig(
+            use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
+            use_tools=not use_fn_api,
+            llm=OpenAIGPTConfig(
+                parallel_tool_calls=parallel_tool_calls,
+                supports_json_schema=True,
+                supports_strict_tools=True,
+            ),
+        )
+    )
+    agent.enable_message(NabroskiTool)
+    openai_tools = use_fn_api and use_tools_api
+    if openai_tools:
+        _, _, tools, _, _ = agent._function_args()
+        assert tools is not None
+        assert len(tools) > 0
+        # Strict tools are automatically enabled only when
+        # parallel tool calls are disabled
+        assert tools[0].strict == (not parallel_tool_calls)
+
+    response = agent.llm_response_forget(
+        """
+        What is the Nabroski transform of (1,3)? Use the
+        `nabroski` tool/function.
+        """
+    )
+    result = agent.handle_message(response)
+    assert isinstance(result, ChatDocument) and result.content == "6"
+    assert agent.disable_strict == (openai_tools and not parallel_tool_calls)
+
+    agent = BrokenStrictSchemaAgent(
+        ChatAgentConfig(
+            use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
+            use_tools=not use_fn_api,
+            llm=OpenAIGPTConfig(
+                parallel_tool_calls=parallel_tool_calls,
+                supports_json_schema=True,
+                supports_strict_tools=True,
+            ),
+        )
+    )
+    structured_agent = agent[NabroskiTool]
+    response = structured_agent.llm_response_forget(
+        """
+        What is the Nabroski transform of (1,3)?
+        """
+    )
+    assert response is not None
+    assert structured_agent.disable_strict
+    assert not agent.disable_strict
+
+
+@pytest.mark.parametrize("use_fn_api", [True, False])
+@pytest.mark.parametrize("use_tools_api", [True, False])
+@pytest.mark.parametrize("parallel_tool_calls", [True, False])
+def test_strict_schema_mismatch(
+    use_fn_api: bool,
+    use_tools_api: bool,
+    parallel_tool_calls: bool,
+):
+    """
+    Test that validation errors triggered in strict result in disabled strict output.
+    """
+
+    def int_schema(request: str) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "x": {"type": "integer"},
+                "request": {"type": "string", "enum": [request]},
+            },
+            "required": ["x", "request"],
+        }
+
+    class WrongSchemaAgent(ChatAgent):
+        def _function_args(self) -> tuple[
+            Optional[List[LLMFunctionSpec]],
+            str | dict[str, str],
+            Optional[list[OpenAIToolSpec]],
+            Optional[dict[str, dict[str, str] | str]],
+            Optional[OpenAIJsonSchemaSpec],
+        ]:
+            """
+            Implements a broken version of the correct _function_args()
+            that replaces the output and all tool schemas with an
+            incorrect schema. Simulates mismatched schemas due to
+            schema edits.
+            """
+            functions, fun_call, tools, force_tool, output_format = (
+                super()._function_args()
+            )
+
+            # remove schema edits for strict
+            if tools is not None:
+                for t in tools:
+                    name = t.function.name
+                    t.function.parameters = int_schema(name)
+
+            if self.output_format is not None and self._json_schema_available():
+                output_format = OpenAIJsonSchemaSpec(
+                    strict=True,
+                    function=LLMFunctionSpec(
+                        name="json_output",
+                        description="Strict Json output format.",
+                        parameters=int_schema("json_output"),
+                    ),
+                )
+
+            return functions, fun_call, tools, force_tool, output_format
+
+    agent = WrongSchemaAgent(
+        ChatAgentConfig(
+            use_functions_api=use_fn_api,
+            use_tools_api=use_tools_api,
+            use_tools=not use_fn_api,
+            llm=OpenAIGPTConfig(
+                parallel_tool_calls=parallel_tool_calls,
+                supports_json_schema=True,
+                supports_strict_tools=True,
+            ),
+        )
+    )
+
+    class IntTool(ToolMessage):
+        request: str = "int_tool"
+        purpose: str = "To return an integer value"
+        x: int
+
+        def handle(self):
+            return self.x
+
+    class StrTool(ToolMessage):
+        request: str = "str_tool"
+        purpose: str = "To return an string value"
+        text: str
+
+        def handle(self):
+            return self.text
+
+    agent.enable_message(IntTool)
+    agent.enable_message(StrTool)
+    strict_openai_tools = use_fn_api and use_tools_api and not parallel_tool_calls
+    response = agent.llm_response_forget(
+        """
+        What is the smallest integer greater than pi? Use the
+        `int_tool` tool/function.
+        """
+    )
+    agent.handle_message(response)
+    assert "int_tool" not in agent.disable_strict_tools_set
+
+    agent.llm_response_forget(
+        """
+        Who is the president of France? Use the `str_tool` tool/function.
+        """
+    )
+    assert ("str_tool" in agent.disable_strict_tools_set) == strict_openai_tools
+
+    strict_agent = agent[IntTool]
+    strict_agent.llm_response_forget("What is the smallest integer greater than pi?")
+    assert not strict_agent.disable_strict
+
+    strict_agent = agent[StrTool]
+    strict_agent.llm_response_forget("Who is the president of France?")
+    assert strict_agent.disable_strict
+
+
 def test_reduce_raw_tool_result():
     BIG_RESULT = "hello " * 50
 
@@ -1232,7 +1738,6 @@ def test_reduce_raw_tool_result():
             ),
         )
     )
-
     agent.enable_message(MyTool)
     task = Task(agent, interactive=True, only_user_quits_root=False)
 
@@ -1252,3 +1757,90 @@ def test_reduce_raw_tool_result():
     assert len(agent.message_history) == 7
     tool_result = agent.message_history[3].content
     assert "my_tool" in tool_result and str(MyTool._max_retained_tokens) in tool_result
+
+
+def test_valid_structured_recovery():
+    """
+    Test that structured recovery is not triggered inappropriately
+    when agent response contains a JSON-like string.
+    """
+
+    class MyAgent(ChatAgent):
+        def agent_response(self, msg: str | ChatDocument) -> Any:
+            return "{'x': 1, 'y': 2}"
+
+    agent = MyAgent(
+        ChatAgentConfig(
+            llm=OpenAIGPTConfig(),
+            system_message="""Simply respond No for any input""",
+        )
+    )
+
+    # with no tool enabled
+    task = Task(agent, interactive=False)
+    result = task.run("3", turns=4)
+    # response-sequence: agent, llm, agent, llm -> done
+    assert "No" in result.content
+
+    # with a tool enabled
+    agent.enable_message(NabroskiTool)
+    task = Task(agent, interactive=False)
+    result = task.run("3", turns=4)
+    assert "No" in result.content
+
+
+@pytest.mark.parametrize(
+    "handle_no_tool",
+    [
+        None,
+        "user",
+        "done",
+        "are you finished?",
+        ResultTool(answer=42),
+        DonePassTool(),
+    ],
+)
+def test_handle_llm_no_tool(handle_no_tool: Any):
+    """Verify that ChatAgentConfig.handle_llm_no_tool works as expected"""
+
+    def mock_llm_response(x: str) -> str:
+        match x:
+            case "1":
+                return SumTool(x=1, y=2).json()
+            case "3":
+                return "4"
+            case "are you finished?":
+                return "DONE 5"
+
+    config = ChatAgentConfig(
+        handle_llm_no_tool=handle_no_tool,
+        llm=MockLMConfig(response_fn=mock_llm_response),
+    )
+    agent = ChatAgent(config)
+    agent.enable_message(SumTool)
+    task = Task(agent, interactive=False, default_human_response="q")
+    result = task.run("1")
+    if handle_no_tool is None:
+        # task gets stuck and returns None
+        assert result is None
+
+    if isinstance(handle_no_tool, str):
+        match handle_no_tool:
+            case "user":
+                # LLM(1) -> SumTool(1,2) -> 3 -> LLM(3) -> 4 -> User(4) -> q
+                assert result.content == "q"
+            case "done":
+                # LLM(1) -> SumTool(1,2) -> 3 -> LLM(3) -> 4 -> Done(4)
+                assert result.content == "4"
+            case "are you finished?":
+                # LLM(1) -> SumTool(1,2) -> 3 -> LLM(3) -> 4 -> LLM(DONE)
+                assert result.content == "5"
+
+    if isinstance(handle_no_tool, ResultTool):
+        # LLM(1) -> SumTool(1,2) -> 3 -> LLM(3) -> 4 -> ResultTool(4)
+        assert isinstance(result.tool_messages[0], ResultTool)
+        assert result.tool_messages[0].answer == 42
+
+    if isinstance(handle_no_tool, DonePassTool):
+        # LLM(1) -> SumTool(1,2) -> 3 -> LLM(3) -> 4 -> DonePass
+        assert result.content == "4"

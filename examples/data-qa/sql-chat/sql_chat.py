@@ -7,7 +7,8 @@ Note if you are using this with a postgres db, you will need to:
     - `sudo apt-get install libpq-dev` on Ubuntu,
     - `brew install postgresql` on Mac, etc.
 (b) langroid with the postgres extra, e.g. `pip install langroid[postgres]`
-    or `poetry add langroid[postgres]` or `poetry install -E postgres`.
+    or `poetry add langroid[postgres]` or `poetry install -E postgres`
+    or `uv pip install langroid[postgres]` or `uv add langroid[postgres]`.
     If this gives you an error, try `pip install psycopg2-binary` in your virtualenv.
 """
 
@@ -27,10 +28,14 @@ except ImportError as e:
 
 from prettytable import PrettyTable
 
-from utils import get_database_uri, fix_uri
+try:
+    from .utils import get_database_uri, fix_uri
+except ImportError:
+    from utils import get_database_uri, fix_uri
+from langroid.agent.task import Task
 from langroid.agent.special.sql.sql_chat_agent import (
     SQLChatAgentConfig,
-    make_sql_chat_task,
+    SQLChatAgent,
 )
 from langroid.language_models.openai_gpt import OpenAIChatModel, OpenAIGPTConfig
 from langroid.utils.configuration import set_global, Settings
@@ -188,6 +193,7 @@ def main(
         use_functions_api=not tools,
         show_stats=False,
         chat_mode=True,
+        use_helper=True,
         context_descriptions=context_descriptions,  # Add context descriptions to the config
         use_schema_tools=schema_tools,
         addressing_prefix=SEND_TO,
@@ -195,8 +201,10 @@ def main(
             chat_model=OpenAIChatModel.GPT4,
         ),
     )
-
-    task = make_sql_chat_task(agent_config, interactive=True, use_helper=True)
+    agent = SQLChatAgent(agent_config)
+    # Set interactive = False, but we user gets chance to respond
+    # when explicitly addressed by LLM
+    task = Task(agent, interactive=False)
     task.run()
 
 

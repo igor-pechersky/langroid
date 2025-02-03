@@ -2,16 +2,28 @@
 Single agent to use to chat with a Retrieval-augmented LLM.
 Repeat: User asks question -> LLM answers.
 
-Run like this:
-python3 examples/docqa/chat.py
+Run like this, either with a document-path (can be URL, file-path, folder-path):
+
+python3 examples/docqa/chat.py url-or-file-orfolder-path
+
+(or run with no arguments to go through the dialog).
+
+If a document-arg is provided, it will be ingested into the vector database.
 
 To change the model, use the --model flag, e.g.:
 
 python3 examples/docqa/chat.py --model ollama/mistral:7b-instruct-v0.2-q8_0
 
-To change the embedding model, use the --embed flag, e.g.:
+To change the embedding service provider, use the --embed and --embedconfig flags, e.g.:
 
-python3 examples/docqa/chat.py --embed BAAI/bge-large-en-v1.5
+For OpenAI
+python3 examples/docqa/chat.py --embed openai
+
+For Huggingface SentenceTransformers
+python3 examples/docqa/chat.py --embed hf --embedconfig BAAI/bge-large-en-v1.5
+
+For Llama.cpp Server
+python3 examples/docqa/chat.py --embed llamacpp --embedconfig localhost:8000
 
 See here for how to set up a Local LLM to work with Langroid:
 https://langroid.github.io/langroid/tutorials/local-llm-setup/
@@ -39,6 +51,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 @app.command()
 def main(
+    doc: str = typer.Argument("", help="url, file-path or folder to chat about"),
     debug: bool = typer.Option(False, "--debug", "-d", help="debug mode"),
     model: str = typer.Option("", "--model", "-m", help="model name"),
     nocache: bool = typer.Option(False, "--nocache", "-nc", help="don't use cache"),
@@ -46,13 +59,20 @@ def main(
         "qdrant", "--vecdb", "-v", help="vector db name (default: qdrant)"
     ),
     nostream: bool = typer.Option(False, "--nostream", "-ns", help="no streaming"),
-    embed: str = typer.Option(
+    embed_provider: str = typer.Option(
         "openai",
         "--embed",
         "-e",
-        help="sentence transformer model name",
-        # e.g. NeuML/pubmedbert-base-embeddings
+        help="Embedding service provider",
+        # openai, hf, llamacpp
     ),
+    embed_config: str = typer.Option(
+        None,
+        "--embedconfig",
+        "-ec",
+        help="Embedding service host/sentence transformer model",
+    ),
+    # e.g. NeuML/pubmedbert-base-embeddings
 ) -> None:
     llm_config = lm.OpenAIGPTConfig(
         chat_model=model or lm.OpenAIChatModel.GPT4o,
@@ -87,19 +107,30 @@ def main(
             # NOTE: PDF parsing is extremely challenging, each library has its own
             # strengths and weaknesses. Try one that works for your use case.
             pdf=PdfParsingConfig(
-                # alternatives: "unstructured", "pdfplumber", "fitz"
-                library="fitz",
+                # see here for possible values:
+                # https://github.com/langroid/langroid/blob/main/langroid/parsing/parser.py
+                library="pymupdf4llm",
             ),
         ),
     )
 
-    if embed == "openai":
-        embed_cfg = lr.embedding_models.OpenAIEmbeddingsConfig()
-    else:
-        embed_cfg = lr.embedding_models.SentenceTransformerEmbeddingsConfig(
-            model_type="sentence-transformer",
-            model_name=embed,
-        )
+    match embed_provider:
+        case "hf":
+            embed_cfg = lr.embedding_models.SentenceTransformerEmbeddingsConfig(
+                model_type="sentence-transformer",
+                model_name=embed_config,
+            )
+        case "llamacpp":
+            embed_cfg = lr.embedding_models.LlamaCppServerEmbeddingsConfig(
+                api_base=embed_config,
+                dims=768,  # Change this to match the dimensions of your embedding model
+            )
+        case "gemini":
+            embed_cfg = lr.embedding_models.GeminiEmbeddingsConfig(
+                model_type="gemini", dims=768
+            )
+        case _:
+            embed_cfg = lr.embedding_models.OpenAIEmbeddingsConfig()
 
     match vecdb:
         case "lance" | "lancedb":
@@ -111,13 +142,17 @@ def main(
             )
         case "qdrant" | "qdrantdb":
             config.vecdb = lr.vector_store.QdrantDBConfig(
-                cloud=True,
+                cloud=False,
                 storage_path=".qdrant/doc-chat",
                 embedding=embed_cfg,
             )
         case "chroma" | "chromadb":
             config.vecdb = lr.vector_store.ChromaDBConfig(
                 storage_path=".chroma/doc-chat",
+                embedding=embed_cfg,
+            )
+        case "weaviate" | "weaviatedb":
+            config.vecdb = lr.vector_store.WeaviateDBConfig(
                 embedding=embed_cfg,
             )
 
@@ -131,8 +166,14 @@ def main(
 
     agent = DocChatAgent(config)
     print("[blue]Welcome to the document chatbot!")
-    agent.user_docs_ingest_dialog()
-    print("[cyan]Enter x or q to quit, or ? for evidence")
+
+    if doc:
+        # TODO - could save time by checking whether we've already ingested this doc(s)
+        agent.ingest_doc_paths([doc])
+    else:
+        agent.user_docs_ingest_dialog()
+
+    print("[cyan]Enter x or q to quit")
 
     task = lr.Task(
         agent,

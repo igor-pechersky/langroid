@@ -20,15 +20,23 @@ set_global(Settings(stream=True))
     "streaming, country, capital",
     [(True, "France", "Paris"), (False, "India", "Delhi")],
 )
-async def test_openai_gpt_async(test_settings: Settings, streaming, country, capital):
+@pytest.mark.parametrize("stream_quiet", [True, False])
+async def test_openai_gpt_async(
+    test_settings: Settings,
+    streaming,
+    country,
+    capital,
+    stream_quiet,
+):
     set_global(test_settings)
     cfg = OpenAIGPTConfig(
         stream=streaming,  # use streaming output if enabled globally
         type="openai",
         max_output_tokens=100,
         min_output_tokens=10,
-        completion_model=OpenAICompletionModel.GPT3_5_TURBO_INSTRUCT,
+        completion_model=OpenAICompletionModel.DAVINCI,
         cache_config=RedisCacheConfig(fake=False),
+        async_stream_quiet=stream_quiet,
     )
 
     mdl = OpenAIGPT(config=cfg)
@@ -82,7 +90,7 @@ async def test_llm_async_concurrent(test_settings: Settings):
         type="openai",
         max_output_tokens=100,
         min_output_tokens=10,
-        completion_model=OpenAICompletionModel.GPT3_5_TURBO_INSTRUCT,
+        completion_model=OpenAICompletionModel.DAVINCI,
         cache_config=RedisCacheConfig(fake=False),
     )
 

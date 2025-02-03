@@ -1,12 +1,23 @@
+import logging
+from typing import Callable
+
 from dotenv import load_dotenv
 from httpx import Timeout
 from openai import AsyncAzureOpenAI, AzureOpenAI
 
 from langroid.language_models.openai_gpt import (
-    OpenAIChatModel,
     OpenAIGPT,
     OpenAIGPTConfig,
 )
+
+azureStructuredOutputList = [
+    "2024-08-06",
+    "2024-11-20",
+]
+
+azureStructuredOutputAPIMin = "2024-08-01-preview"
+
+logger = logging.getLogger(__name__)
 
 
 class AzureConfig(OpenAIGPTConfig):
@@ -20,11 +31,12 @@ class AzureConfig(OpenAIGPTConfig):
         deployment_name (str): can be set in the ``.env`` file as
             ``AZURE_OPENAI_DEPLOYMENT_NAME`` and should be based the custom name you
             chose for your deployment when you deployed a model.
-        model_name (str): can be set in the ``.env`` file as ``AZURE_GPT_MODEL_NAME``
+        model_name (str): can be set in the ``.env``
+            file as ``AZURE_OPENAI_MODEL_NAME``
             and should be based on the model name chosen during setup.
         model_version (str): can be set in the ``.env`` file as
-          ``AZURE_OPENAI_MODEL_VERSION`` and should be based on the model name
-          chosen during setup.
+            ``AZURE_OPENAI_MODEL_VERSION`` and should be based on the model name
+            chosen during setup.
     """
 
     api_key: str = ""  # CAUTION: set this ONLY via env var AZURE_OPENAI_API_KEY
@@ -34,6 +46,10 @@ class AzureConfig(OpenAIGPTConfig):
     model_name: str = ""
     model_version: str = ""  # is used to determine the cost of using the model
     api_base: str = ""
+
+    # Alternatively, bring your own clients:
+    azure_openai_client_provider: Callable[[], AzureOpenAI] | None = None
+    azure_openai_async_client_provider: Callable[[], AsyncAzureOpenAI] | None = None
 
     # all of the vars above can be set via env vars,
     # by upper-casing the name and prefixing with `env_prefix`, e.g.
@@ -62,20 +78,6 @@ class AzureGPT(OpenAIGPT):
         load_dotenv()
         super().__init__(config)
         self.config: AzureConfig = config
-        if self.config.api_key == "":
-            raise ValueError(
-                """
-                AZURE_OPENAI_API_KEY not set in .env file,
-                please set it to your Azure API key."""
-            )
-
-        if self.config.api_base == "":
-            raise ValueError(
-                """
-                AZURE_OPENAI_API_BASE not set in .env file,
-                please set it to your Azure API key."""
-            )
-
         if self.config.deployment_name == "":
             raise ValueError(
                 """
@@ -91,67 +93,61 @@ class AzureGPT(OpenAIGPT):
                 please set it to chat model name in your deployment."""
             )
 
-        # set the chat model to be the same as the model_name
-        # This corresponds to the gpt model you chose for your deployment
-        # when you deployed a model
-        self.set_chat_model()
+        if (
+            self.config.azure_openai_client_provider
+            or self.config.azure_openai_async_client_provider
+        ):
+            if not self.config.azure_openai_client_provider:
+                self.client = None
+                logger.warning(
+                    "Using user-provided Azure OpenAI client, but only async "
+                    "client has been provided. Synchronous calls will fail."
+                )
+            if not self.config.azure_openai_async_client_provider:
+                self.async_client = None
+                logger.warning(
+                    "Using user-provided Azure OpenAI client, but no async "
+                    "client has been provided. Asynchronous calls will fail."
+                )
 
-        self.client = AzureOpenAI(
-            api_key=self.config.api_key,
-            azure_endpoint=self.config.api_base,
-            api_version=self.config.api_version,
-            azure_deployment=self.config.deployment_name,
-        )
-        self.async_client = AsyncAzureOpenAI(
-            api_key=self.config.api_key,
-            azure_endpoint=self.config.api_base,
-            api_version=self.config.api_version,
-            azure_deployment=self.config.deployment_name,
-            timeout=Timeout(self.config.timeout),
-        )
-
-    def set_chat_model(self) -> None:
-        """
-        Sets the chat model configuration based on the model name specified in the
-        ``.env``. This function checks the `model_name` in the configuration and sets
-        the appropriate chat model in the `config.chat_model`. It supports handling for
-        '35-turbo' and 'gpt-4' models. For 'gpt-4', it further delegates the handling
-        to `handle_gpt4_model` method. If the model name does not match any predefined
-        models, it defaults to `OpenAIChatModel.GPT4`.
-        """
-        MODEL_35_TURBO = "35-turbo"
-        MODEL_GPT4 = "gpt-4"
-
-        if self.config.model_name == MODEL_35_TURBO:
-            self.config.chat_model = OpenAIChatModel.GPT3_5_TURBO
-        elif self.config.model_name == MODEL_GPT4:
-            self.handle_gpt4_model()
+            if self.config.azure_openai_client_provider:
+                self.client = self.config.azure_openai_client_provider()
+            if self.config.azure_openai_async_client_provider:
+                self.async_client = self.config.azure_openai_async_client_provider()
+                self.async_client.timeout = Timeout(self.config.timeout)
         else:
-            self.config.chat_model = OpenAIChatModel.GPT4
+            if self.config.api_key == "":
+                raise ValueError(
+                    """
+                    AZURE_OPENAI_API_KEY not set in .env file,
+                    please set it to your Azure API key."""
+                )
 
-    def handle_gpt4_model(self) -> None:
-        """
-        Handles the setting of the GPT-4 model in the configuration.
-        This function checks the `model_version` in the configuration.
-        If the version is not set, it raises a ValueError indicating
-        that the model version needs to be specified in the ``.env``
-        file.  It sets `OpenAIChatMode.GPT4o` if the version is
-        '2024-05-13', `OpenAIChatModel.GPT4_TURBO` if the version is
-        '1106-Preview', otherwise, it defaults to setting
-        `OpenAIChatModel.GPT4`.
-        """
-        VERSION_1106_PREVIEW = "1106-Preview"
-        VERSION_GPT4o = "2024-05-13"
+            if self.config.api_base == "":
+                raise ValueError(
+                    """
+                    AZURE_OPENAI_API_BASE not set in .env file,
+                    please set it to your Azure API key."""
+                )
 
-        if self.config.model_version == "":
-            raise ValueError(
-                "AZURE_OPENAI_MODEL_VERSION not set in .env file. "
-                "Please set it to the chat model version used in your deployment."
+            self.client = AzureOpenAI(
+                api_key=self.config.api_key,
+                azure_endpoint=self.config.api_base,
+                api_version=self.config.api_version,
+                azure_deployment=self.config.deployment_name,
+            )
+            self.async_client = AsyncAzureOpenAI(
+                api_key=self.config.api_key,
+                azure_endpoint=self.config.api_base,
+                api_version=self.config.api_version,
+                azure_deployment=self.config.deployment_name,
+                timeout=Timeout(self.config.timeout),
             )
 
-        if self.config.model_version == VERSION_GPT4o:
-            self.config.chat_model = OpenAIChatModel.GPT4o
-        elif self.config.model_version == VERSION_1106_PREVIEW:
-            self.config.chat_model = OpenAIChatModel.GPT4_TURBO
-        else:
-            self.config.chat_model = OpenAIChatModel.GPT4
+        # set the chat model to be the same as the model_name
+        self.config.chat_model = self.config.model_name
+
+        self.supports_json_schema = (
+            self.config.api_version >= azureStructuredOutputAPIMin
+            and self.config.model_version in azureStructuredOutputList
+        )

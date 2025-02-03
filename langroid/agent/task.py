@@ -16,6 +16,7 @@ from typing import (
     Dict,
     List,
     Optional,
+    Self,
     Tuple,
     Type,
     TypeVar,
@@ -199,7 +200,11 @@ class Task:
                 control of task termination.
             system_message (str): if not empty, overrides agent's system_message
             user_message (str): if not empty, overrides agent's user_message
-            restart (bool): if true, resets the agent's message history *at every run*.
+            restart (bool): if true (default), resets the agent's message history
+                *at every run* when it is the top-level task. Ignored when
+                the task is a subtask of another task. Restart behavior of a subtask's
+                `run()` can be controlled via the `TaskConfig.restart_as_subtask`
+                setting.
             default_human_response (str|None): default response from user; useful for
                 testing, to avoid interactive input from user.
                 [Instead of this, setting `interactive` usually suffices]
@@ -570,7 +575,7 @@ class Task:
 
         if self.caller is not None and self.caller.logger is not None:
             self.logger = self.caller.logger
-        else:
+        elif self.logger is None:
             self.logger = RichFileLogger(
                 str(Path(self.config.logs_dir) / f"{self.name}.log"),
                 color=self.color_log,
@@ -578,7 +583,7 @@ class Task:
 
         if self.caller is not None and self.caller.tsv_logger is not None:
             self.tsv_logger = self.caller.tsv_logger
-        else:
+        elif self.tsv_logger is None:
             self.tsv_logger = setup_file_logger(
                 "tsv_logger",
                 str(Path(self.config.logs_dir) / f"{self.name}.tsv"),
@@ -598,7 +603,7 @@ class Task:
         for t in self.sub_tasks:
             t.reset_all_sub_tasks()
 
-    def __getitem__(self, return_type: type) -> Task:
+    def __getitem__(self, return_type: type) -> Self:
         """Returns a (shallow) copy of `self` with a default return type."""
         clone = copy.copy(self)
         clone.default_return_type = return_type
@@ -732,8 +737,37 @@ class Task:
         if return_type is None:
             return_type = self.default_return_type
 
+        # If possible, take a final strict decoding step
+        # when the output does not match `return_type`
         if return_type is not None and return_type != ChatDocument:
-            return self.agent.from_ChatDocument(final_result, return_type)
+            parsed_result = self.agent.from_ChatDocument(final_result, return_type)
+
+            if (
+                parsed_result is None
+                and isinstance(self.agent, ChatAgent)
+                and self.agent._json_schema_available()
+            ):
+                strict_agent = self.agent[return_type]
+                output_args = strict_agent._function_args()[-1]
+                if output_args is not None:
+                    schema = output_args.function.parameters
+                    strict_result = strict_agent.llm_response(
+                        f"""
+                        A response adhering to the following JSON schema was expected:
+                        {schema}
+
+                        Please resubmit with the correct schema. 
+                        """
+                    )
+
+                    if strict_result is not None:
+                        return cast(
+                            Optional[T],
+                            strict_agent.from_ChatDocument(strict_result, return_type),
+                        )
+
+            return parsed_result
+
         return final_result
 
     @overload
@@ -895,8 +929,37 @@ class Task:
         if return_type is None:
             return_type = self.default_return_type
 
+        # If possible, take a final strict decoding step
+        # when the output does not match `return_type`
         if return_type is not None and return_type != ChatDocument:
-            return self.agent.from_ChatDocument(final_result, return_type)
+            parsed_result = self.agent.from_ChatDocument(final_result, return_type)
+
+            if (
+                parsed_result is None
+                and isinstance(self.agent, ChatAgent)
+                and self.agent._json_schema_available()
+            ):
+                strict_agent = self.agent[return_type]
+                output_args = strict_agent._function_args()[-1]
+                if output_args is not None:
+                    schema = output_args.function.parameters
+                    strict_result = await strict_agent.llm_response_async(
+                        f"""
+                        A response adhering to the following JSON schema was expected:
+                        {schema}
+
+                        Please resubmit with the correct schema. 
+                        """
+                    )
+
+                    if strict_result is not None:
+                        return cast(
+                            Optional[T],
+                            strict_agent.from_ChatDocument(strict_result, return_type),
+                        )
+
+            return parsed_result
+
         return final_result
 
     def _pre_run_loop(
@@ -1366,8 +1429,15 @@ class Task:
         else:
             response_fn = self._entity_responder_map[cast(Entity, e)]
             result = response_fn(self.pending_message)
-            # update result.tool_messages if any
-            if isinstance(result, ChatDocument):
+            # update result.tool_messages if any.
+            # Do this only if sender is LLM, since this could be
+            # a tool-call result from the Agent responder, which may
+            # contain strings that look like tools, and we don't want to
+            # trigger strict tool recovery due to that.
+            if (
+                isinstance(result, ChatDocument)
+                and result.metadata.sender == Entity.LLM
+            ):
                 self.agent.try_get_tool_messages(result)
 
         result_chat_doc = self.agent.to_ChatDocument(
@@ -1767,12 +1837,6 @@ class Task:
             and (result.content in USER_QUIT_STRINGS or done_result)
             and result.metadata.sender == Entity.USER
         )
-        if self._level == 0 and self._user_can_respond() and self.only_user_quits_root:
-            # for top-level task, only user can quit out
-            return (user_quit, StatusCode.USER_QUIT if user_quit else StatusCode.OK)
-
-        if self.is_done:
-            return (True, StatusCode.DONE)
 
         if self.n_stalled_steps >= self.max_stalled_steps:
             # we are stuck, so bail to avoid infinite loop
@@ -1800,6 +1864,14 @@ class Task:
                     return (True, StatusCode.MAX_TOKENS)
             except Exception:
                 pass
+
+        if self._level == 0 and self._user_can_respond() and self.only_user_quits_root:
+            # for top-level task, only user can quit out
+            return (user_quit, StatusCode.USER_QUIT if user_quit else StatusCode.OK)
+
+        if self.is_done:
+            return (True, StatusCode.DONE)
+
         final = (
             # no valid response from any entity/agent in current turn
             result is None

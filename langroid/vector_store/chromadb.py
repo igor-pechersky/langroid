@@ -1,9 +1,8 @@
 import json
 import logging
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 from langroid.embedding_models.base import (
-    EmbeddingModel,
     EmbeddingModelsConfig,
 )
 from langroid.embedding_models.models import OpenAIEmbeddingsConfig
@@ -19,6 +18,10 @@ logger = logging.getLogger(__name__)
 class ChromaDBConfig(VectorStoreConfig):
     collection_name: str = "temp"
     storage_path: str = ".chroma/data"
+    distance: Literal["cosine", "l2", "ip"] = "cosine"
+    construction_ef: int = 100
+    search_ef: int = 100
+    max_neighbors: int = 16
     embedding: EmbeddingModelsConfig = OpenAIEmbeddingsConfig()
     host: str = "127.0.0.1"
     port: int = 6333
@@ -32,11 +35,10 @@ class ChromaDB(VectorStore):
         except ImportError:
             raise LangroidImportError("chromadb", "chromadb")
         self.config = config
-        emb_model = EmbeddingModel.create(config.embedding)
-        self.embedding_fn = emb_model.embedding_fn()
         self.client = chromadb.Client(
             chromadb.config.Settings(
                 # chroma_db_impl="duckdb+parquet",
+                # is_persistent=bool(config.storage_path),
                 persist_directory=config.storage_path,
             )
         )
@@ -64,7 +66,7 @@ class ChromaDB(VectorStore):
             self.client.delete_collection(name=c.name)
         logger.warning(
             f"""
-            Deleted {n_empty_deletes} empty collections and 
+            Deleted {n_empty_deletes} empty collections and
             {n_non_empty_deletes} non-empty collections.
             """
         )
@@ -110,6 +112,13 @@ class ChromaDB(VectorStore):
             name=self.config.collection_name,
             embedding_function=self.embedding_fn,
             get_or_create=not replace,
+            metadata={
+                "hnsw:space": self.config.distance,
+                "hnsw:construction_ef": self.config.construction_ef,
+                "hnsw:search_ef": self.config.search_ef,
+                # we could expose other configs, see:
+                # https://docs.trychroma.com/docs/collections/configure
+            },
         )
 
     def add_documents(self, documents: Sequence[Document]) -> None:
@@ -126,6 +135,13 @@ class ChromaDB(VectorStore):
             m["window_ids"] = ",".join(m["window_ids"])
 
         ids = [str(d.id()) for d in documents]
+
+        colls = self.list_collections(empty=True)
+        if self.config.collection_name is None:
+            raise ValueError("No collection name set, cannot ingest docs")
+        if self.config.collection_name not in colls:
+            self.create_collection(self.config.collection_name, replace=True)
+
         self.collection.add(
             # embedding_models=embedding_models,
             documents=contents,

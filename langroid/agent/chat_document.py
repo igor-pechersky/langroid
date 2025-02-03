@@ -117,6 +117,7 @@ class ChatDocument(Document):
         attachment (None | ChatDocAttachment): Any additional data attached.
     """
 
+    reasoning: str = ""  # reasoning produced by a reasoning LLM
     content_any: Any = None  # to hold arbitrary data returned by responders
     oai_tool_calls: Optional[List[OpenAIToolCall]] = None
     oai_tool_id2result: Optional[OrderedDict[str, str]] = None
@@ -217,9 +218,14 @@ class ChatDocument(Document):
         if self.function_call is not None:
             tool_type = "FUNC"
             tool = self.function_call.name
-        elif (json_tools := self.get_tool_names()) != []:
-            tool_type = "TOOL"
-            tool = json_tools[0]
+        else:
+            try:
+                json_tools = self.get_tool_names()
+            except Exception:
+                json_tools = []
+            if json_tools != []:
+                tool_type = "TOOL"
+                tool = json_tools[0]
         recipient = self.metadata.recipient
         content = self.content
         sender_entity = self.metadata.sender
@@ -292,6 +298,7 @@ class ChatDocument(Document):
                 ChatDocument._clean_fn_call(oai_tc.function)
         return ChatDocument(
             content=message,
+            reasoning=response.reasoning,
             content_any=message,
             oai_tool_calls=response.oai_tool_calls,
             function_call=response.function_call,

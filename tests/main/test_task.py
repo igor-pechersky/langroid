@@ -3,7 +3,8 @@ Other tests for Task are in test_chat_agent.py
 """
 
 import asyncio
-from typing import List, Optional
+import json
+from typing import Any, List, Optional
 
 import pytest
 
@@ -18,7 +19,9 @@ from langroid.agent.tools.orchestration import (
     DoneTool,
     PassTool,
 )
+from langroid.language_models.base import LLMMessage
 from langroid.language_models.mock_lm import MockLMConfig
+from langroid.language_models.openai_gpt import OpenAIGPTConfig
 from langroid.mytypes import Entity
 from langroid.utils.configuration import (
     Settings,
@@ -537,9 +540,9 @@ def test_task_2_agent_tool(
     assert "200" in response.content
 
 
-@pytest.mark.parametrize("use_fn_api", [False, True])
+@pytest.mark.parametrize("use_fn_api", [True, False])
 @pytest.mark.parametrize("use_tools_api", [True, False])
-@pytest.mark.parametrize("use_orch_tools", [False, True])
+@pytest.mark.parametrize("use_orch_tools", [True, False])
 def test_task_2_agent_2_tool(
     test_settings: Settings,
     use_fn_api: bool,
@@ -593,6 +596,21 @@ def test_task_2_agent_2_tool(
                 {msg.feedback}
                 """
 
+        def handle_message_fallback(self, msg: str | ChatDocument) -> Any:
+            if isinstance(msg, ChatDocument) and msg.metadata.sender == Entity.LLM:
+                return f"""
+                Your INTENT is unclear!
+                
+                - If you intended to say you're finished with your task,
+                then use the `{DoneTool.name()}` tool/function with 
+                the `content` field set to the summary of the Polinsky transforms
+                of 100 and 500.
+                
+                - If you intended to ask about the Polinsky transform,
+                then use the `{QueryTool.name()}` tool/function to ask about
+                the Polinsky transform of a number.
+                """
+
     done_tool_name = DoneTool.default_value("request")
     requestor_agent = Requestor(
         ChatAgentConfig(
@@ -606,7 +624,8 @@ def test_task_2_agent_2_tool(
                     This is a mysterious transform that you do not
                     know how to compute, but you try to find out, by GUESSING the
                     value and asking for CONFIRMATION, 
-                    using the `polinsky_query` tool/function.
+                    using the `polinsky_query` tool/function, ONE NUMBER AT A TIME.
+                    
                     Your FIRST GUESS is to simply guess that the Polinsky transform
                     of your number is the SUCCESSOR of the number.
                     Your SECOND GUESS is to guess that the Polinsky transform
@@ -622,6 +641,9 @@ def test_task_2_agent_2_tool(
                     use the `{done_tool_name}` with `content` showing summary 
                     of the transforms in this format:
                     '(number1, transform1), (number2, transform2)'
+                    
+                    IMPORTANT - YOU CAN ONLY use the `polinsky_feedback` tool/function
+                    ONCE per message.
                     """,
         )
     )
@@ -651,13 +673,16 @@ def test_task_2_agent_2_tool(
             use_tools_api=use_tools_api,
             use_tools=not use_fn_api,
             system_message="""
-                    When you receive a query asking whether the Polinsky
-                    transform of a number x is y, and you must give FEEDBACK
-                    on this using the `polinsky_feedback` tool/function.
-                    Here are the rules:
-                    - If y = x + 1, feedback should be "WRONG, try another guess",
-                    - Otherwise, feedback should be EMPTY STRING: ""
-                    """,
+            When you receive a query asking whether the Polinsky
+            transform of a number x is y, and you must give FEEDBACK
+            on this using the `polinsky_feedback` tool/function.
+            Here are the rules:
+            - If y = x + 1, feedback should be "WRONG, try another guess",
+            - Otherwise, feedback should be EMPTY STRING: ""
+            
+            IMPORTANT - YOU CAN ONLY use the `polinsky_feedback` tool/function
+            ONCE per message.
+            """,
         )
     )
 
@@ -673,9 +698,13 @@ def test_task_2_agent_2_tool(
     assert all(s in response.content for s in strings)
 
 
-def test_task_tool_responses():
+def test_task_tool_responses(
+    test_settings: Settings,
+):
     """Test that returning ToolMessage from an entity-responder or a Task.run() are
     handled correctly"""
+
+    set_global(test_settings)
 
     class IncrementTool(ToolMessage):
         request = "increment"
@@ -779,3 +808,174 @@ def test_task_tool_responses():
 
     result = processor_task[int].run(10)
     assert result == 11
+
+
+def test_task_output_format_sequence():
+    """
+    Test that `Task`s correctly execute a sequence of steps
+    controlled by the agent's `output_format`, and that `output_format`
+    is handled by default without `enable_message`.
+    """
+
+    class MultiplyTool(ToolMessage):
+        request: str = "multiply"
+        purpose: str = "To multiply two integers."
+        a: int
+        b: int
+
+    class IncrementTool(ToolMessage):
+        request: str = "increment"
+        purpose: str = "To increment an integer."
+        x: int
+
+    class PowerTool(ToolMessage):
+        request: str = "power"
+        purpose: str = "To compute `x` ** `y`."
+        x: int
+        y: int
+
+    class CompositionAgent(ChatAgent):
+        def __init__(self, config: ChatAgentConfig = ChatAgentConfig()):
+            super().__init__(config)
+            self.set_output_format(MultiplyTool)
+
+        def multiply(self, message: MultiplyTool) -> str:
+            self.set_output_format(IncrementTool)
+
+            return str(message.a * message.b)
+
+        def increment(self, message: IncrementTool) -> str:
+            self.set_output_format(PowerTool)
+
+            return str(message.x + 1)
+
+        def power(self, message: PowerTool) -> str:
+            return f"{DONE} {message.x ** message.y}"
+
+    def to_tool(message: LLMMessage, tool: type[ToolMessage]) -> ToolMessage:
+        return tool.parse_obj(json.loads(message.content))
+
+    def test_sequence(x: int) -> None:
+        agent = CompositionAgent(
+            ChatAgentConfig(
+                llm=OpenAIGPTConfig(
+                    supports_json_schema=True,
+                    supports_strict_tools=True,
+                ),
+            )
+        )
+        task = lr.Task(
+            agent,
+            system_message="""
+            You will be provided with a number `x` and will compute (3 * x + 1) ** 4,
+            using these ops sequentially: multiplication, increment, and power.
+            """,
+            interactive=False,
+            default_return_type=int,
+        )
+        output = task.run(x)
+        assert isinstance(output, int)
+        assert output == (3 * x + 1) ** 4
+
+        # check steps
+        messages = agent.message_history
+        assert len(messages) >= 7
+
+        multiply_message: MultiplyTool = to_tool(messages[2], MultiplyTool)  # type: ignore
+        assert {multiply_message.a, multiply_message.b} == {3, x}
+
+        increment_message: IncrementTool = to_tool(messages[4], IncrementTool)  # type: ignore
+        assert increment_message.x == 3 * x
+
+        power_message: PowerTool = to_tool(messages[6], PowerTool)  # type: ignore
+        assert (power_message.x, power_message.y) == (3 * x + 1, 4)
+
+    for x in range(5):
+        test_sequence(x)
+
+
+@pytest.mark.asyncio
+async def test_task_output_format_sequence_async():
+    """
+    Test that async `Task`s correctly execute a sequence of steps
+    controlled by the agent's `output_format`, and that `output_format`
+    is handled by default without `enable_message`.
+    """
+
+    class MultiplyTool(ToolMessage):
+        request: str = "multiply"
+        purpose: str = "To multiply two integers."
+        a: int
+        b: int
+
+    class IncrementTool(ToolMessage):
+        request: str = "increment"
+        purpose: str = "To increment an integer."
+        x: int
+
+    class PowerTool(ToolMessage):
+        request: str = "power"
+        purpose: str = "To compute `x` ** `y`."
+        x: int
+        y: int
+
+    class CompositionAgent(ChatAgent):
+        def __init__(self, config: ChatAgentConfig = ChatAgentConfig()):
+            super().__init__(config)
+            self.set_output_format(MultiplyTool)
+
+        def multiply(self, message: MultiplyTool) -> str:
+            self.set_output_format(IncrementTool)
+
+            return str(message.a * message.b)
+
+        def increment(self, message: IncrementTool) -> str:
+            self.set_output_format(PowerTool)
+
+            return str(message.x + 1)
+
+        def power(self, message: PowerTool) -> str:
+            self.set_output_format(MultiplyTool)
+
+            return f"{DONE} {message.x ** message.y}"
+
+    def to_tool(message: LLMMessage, tool: type[ToolMessage]) -> ToolMessage:
+        return tool.parse_obj(json.loads(message.content))
+
+    async def test_sequence(x: int) -> None:
+        agent = CompositionAgent(
+            ChatAgentConfig(
+                llm=OpenAIGPTConfig(
+                    supports_json_schema=True,
+                    supports_strict_tools=True,
+                ),
+            )
+        )
+        task = lr.Task(
+            agent,
+            system_message="""
+            You will be provided with a number `x` and will compute (3 * x + 1) ** 4,
+            using these ops sequentially: multiplication, increment, and power.
+            """,
+            interactive=False,
+            default_return_type=int,
+        )
+        output = await task.run_async(x)
+        assert isinstance(output, int)
+        assert output == (3 * x + 1) ** 4
+
+        # check steps
+        messages = agent.message_history
+        assert len(messages) >= 7
+
+        multiply_message: MultiplyTool = to_tool(messages[2], MultiplyTool)  # type: ignore
+        assert {multiply_message.a, multiply_message.b} == {3, x}
+
+        increment_message: IncrementTool = to_tool(messages[4], IncrementTool)  # type: ignore
+        assert increment_message.x == 3 * x
+
+        power_message: PowerTool = to_tool(messages[6], PowerTool)  # type: ignore
+        assert (power_message.x, power_message.y) == (3 * x + 1, 4)
+
+    for x in range(5):
+        await test_sequence(x)

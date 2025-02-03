@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import time
 import uuid
 from typing import Dict, List, Optional, Sequence, Tuple, TypeVar
 
@@ -23,11 +24,10 @@ from qdrant_client.http.models import (
 )
 
 from langroid.embedding_models.base import (
-    EmbeddingModel,
     EmbeddingModelsConfig,
 )
 from langroid.embedding_models.models import OpenAIEmbeddingsConfig
-from langroid.mytypes import Document, EmbeddingFunction, Embeddings
+from langroid.mytypes import Document, Embeddings
 from langroid.utils.configuration import settings
 from langroid.vector_store.base import VectorStore, VectorStoreConfig
 
@@ -77,16 +77,13 @@ class QdrantDB(VectorStore):
     def __init__(self, config: QdrantDBConfig = QdrantDBConfig()):
         super().__init__(config)
         self.config: QdrantDBConfig = config
-        emb_model = EmbeddingModel.create(config.embedding)
-        self.embedding_fn: EmbeddingFunction = emb_model.embedding_fn()
-        self.embedding_dim = emb_model.embedding_dims
         if self.config.use_sparse_embeddings:
             try:
                 from transformers import AutoModelForMaskedLM, AutoTokenizer
             except ImportError:
                 raise ImportError(
                     """
-                    To use sparse embeddings, 
+                    To use sparse embeddings,
                     you must install langroid with the [transformers] extra, e.g.:
                     pip install "langroid[transformers]"
                     """
@@ -117,10 +114,10 @@ class QdrantDB(VectorStore):
                 config.cloud = True
         elif config.cloud and None in [key, url]:
             logger.warning(
-                f"""QDRANT_API_KEY, QDRANT_API_URL env variable must be set to use 
-                QdrantDB in cloud mode. Please set these values 
-                in your .env file. 
-                Switching to local storage at {config.storage_path} 
+                f"""QDRANT_API_KEY, QDRANT_API_URL env variable must be set to use
+                QdrantDB in cloud mode. Please set these values
+                in your .env file.
+                Switching to local storage at {config.storage_path}
                 """
             )
             config.cloud = False
@@ -189,7 +186,7 @@ class QdrantDB(VectorStore):
             self.client.delete_collection(collection_name=name)
         logger.warning(
             f"""
-            Deleted {n_empty_deletes} empty collections and 
+            Deleted {n_empty_deletes} empty collections and
             {n_non_empty_deletes} non-empty collections.
             """
         )
@@ -325,6 +322,26 @@ class QdrantDB(VectorStore):
             }
             if self.config.use_sparse_embeddings:
                 vectors["text-sparse"] = sparse_embedding_vecs[i : i + b]
+            coll_found: bool = False
+            for _ in range(3):
+                # poll until collection is ready
+                if (
+                    self.client.collection_exists(self.config.collection_name)
+                    and self.client.get_collection(self.config.collection_name).status
+                    == CollectionStatus.GREEN
+                ):
+                    coll_found = True
+                    break
+                time.sleep(1)
+
+            if not coll_found:
+                raise ValueError(
+                    f"""
+                    QdrantDB Collection {self.config.collection_name} 
+                    not found or not ready
+                    """
+                )
+
             self.client.upsert(
                 collection_name=self.config.collection_name,
                 points=Batch(

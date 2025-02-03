@@ -1,6 +1,8 @@
 import pytest
 
+from langroid.agent.task import Task
 from langroid.exceptions import LangroidImportError
+from langroid.language_models.openai_gpt import OpenAIGPTConfig
 
 try:
     from sqlalchemy import Column, ForeignKey, Integer, String, create_engine
@@ -10,8 +12,8 @@ except ImportError as e:
     raise LangroidImportError(extra="sql", error=str(e))
 
 from langroid.agent.special.sql.sql_chat_agent import (
+    SQLChatAgent,
     SQLChatAgentConfig,
-    make_sql_chat_task,
 )
 from langroid.utils.configuration import Settings, set_global
 
@@ -124,12 +126,13 @@ def mock_context() -> dict:
 def _test_sql_chat_agent(
     fn_api: bool,
     tools_api: bool,
+    json_schema: bool,
     db_session: Session,
     context: dict,
     prompt: str,
     answer: str,
     use_schema_tools: bool = False,
-    turns: int = 15,
+    turns: int = 18,
     addressing_prefix: str = "",
 ) -> None:
     """
@@ -145,8 +148,11 @@ def _test_sql_chat_agent(
         use_schema_tools=use_schema_tools,
         addressing_prefix=addressing_prefix,
         chat_mode=False,
+        use_helper=True,
+        llm=OpenAIGPTConfig(supports_json_schema=json_schema),
     )
-    task = make_sql_chat_task(agent_config, interactive=False, use_helper=True)
+    agent = SQLChatAgent(agent_config)
+    task = Task(agent, interactive=False)
 
     # run for enough turns to handle LLM deviations
     # 0: user question
@@ -160,6 +166,7 @@ def _test_sql_chat_agent(
 
 @pytest.mark.parametrize("fn_api", [False, True])
 @pytest.mark.parametrize("tools_api", [False, True])
+@pytest.mark.parametrize("json_schema", [False, True])
 @pytest.mark.parametrize(
     "query,answer",
     [
@@ -172,6 +179,7 @@ def test_sql_chat_agent_query(
     test_settings: Settings,
     fn_api,
     tools_api,
+    json_schema,
     mock_db_session,
     mock_context,
     query,
@@ -183,6 +191,7 @@ def test_sql_chat_agent_query(
         fn_api=fn_api,
         tools_api=tools_api,
         db_session=mock_db_session,
+        json_schema=json_schema,
         context=mock_context,
         prompt=query,
         answer=answer,
@@ -192,6 +201,7 @@ def test_sql_chat_agent_query(
     _test_sql_chat_agent(
         fn_api=fn_api,
         tools_api=tools_api,
+        json_schema=json_schema,
         db_session=mock_db_session,
         context={},
         prompt=query,
@@ -201,10 +211,12 @@ def test_sql_chat_agent_query(
 
 @pytest.mark.parametrize("fn_api", [True, False])
 @pytest.mark.parametrize("tools_api", [True, False])
+@pytest.mark.parametrize("json_schema", [False, True])
 def test_sql_chat_db_update(
     test_settings: Settings,
     fn_api,
     tools_api,
+    json_schema,
     mock_db_session,
     mock_context,
 ):
@@ -213,6 +225,7 @@ def test_sql_chat_db_update(
     _test_sql_chat_agent(
         fn_api=fn_api,
         tools_api=tools_api,
+        json_schema=json_schema,
         db_session=mock_db_session,
         context=mock_context,
         prompt="Update Bob's sale amount to 900",
@@ -222,6 +235,7 @@ def test_sql_chat_db_update(
     _test_sql_chat_agent(
         fn_api=fn_api,
         tools_api=tools_api,
+        json_schema=json_schema,
         db_session=mock_db_session,
         context=mock_context,
         prompt="How much did Bob sell?",
@@ -232,6 +246,7 @@ def test_sql_chat_db_update(
     _test_sql_chat_agent(
         fn_api=fn_api,
         tools_api=tools_api,
+        json_schema=json_schema,
         db_session=mock_db_session,
         context={},
         prompt="Update Bob's sale amount to 9100",
@@ -241,6 +256,7 @@ def test_sql_chat_db_update(
     _test_sql_chat_agent(
         fn_api=fn_api,
         tools_api=tools_api,
+        json_schema=json_schema,
         db_session=mock_db_session,
         context={},
         prompt="How much did Bob sell?",
@@ -250,6 +266,7 @@ def test_sql_chat_db_update(
 
 @pytest.mark.parametrize("tools_api", [True, False])
 @pytest.mark.parametrize("fn_api", [True, False])
+@pytest.mark.parametrize("json_schema", [False, True])
 @pytest.mark.parametrize(
     "query,answer",
     [
@@ -260,6 +277,7 @@ def test_sql_schema_tools(
     test_settings: Settings,
     fn_api,
     tools_api,
+    json_schema,
     mock_db_session,
     mock_context,
     query,
@@ -270,6 +288,7 @@ def test_sql_schema_tools(
     _test_sql_chat_agent(
         fn_api=fn_api,
         tools_api=tools_api,
+        json_schema=json_schema,
         db_session=mock_db_session,
         context=mock_context,
         prompt=query,

@@ -1,4 +1,3 @@
-import ast
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -20,8 +19,9 @@ from typing import (
 
 from langroid.cachedb.base import CacheDBConfig
 from langroid.cachedb.redis_cachedb import RedisCacheConfig
+from langroid.language_models.model_info import get_model_info
 from langroid.parsing.agent_chats import parse_message
-from langroid.parsing.parse_json import top_level_json_field
+from langroid.parsing.parse_json import parse_imperfect_json, top_level_json_field
 from langroid.prompts.dialog import collate_chat_history
 from langroid.pydantic_v1 import BaseModel, BaseSettings, Field
 from langroid.utils.configuration import settings
@@ -43,6 +43,14 @@ ToolChoiceTypes = Literal["none", "auto", "required"]
 ToolTypes = Literal["function"]
 
 
+class StreamEventType(Enum):
+    TEXT = 1
+    FUNC_NAME = 2
+    FUNC_ARGS = 3
+    TOOL_NAME = 4
+    TOOL_ARGS = 5
+
+
 class LLMConfig(BaseSettings):
     """
     Common configuration for all language models.
@@ -53,6 +61,7 @@ class LLMConfig(BaseSettings):
     streamer_async: Optional[Callable[..., Awaitable[None]]] = async_noop_fn
     api_base: str | None = None
     formatter: None | str = None
+    max_output_tokens: int | None = 8192  # specify None to use model_max_output_tokens
     timeout: int = 20  # timeout for API requests
     chat_model: str = ""
     completion_model: str = ""
@@ -60,7 +69,6 @@ class LLMConfig(BaseSettings):
     chat_context_length: int = 8000
     async_stream_quiet: bool = True  # suppress streaming output in async mode?
     completion_context_length: int = 8000
-    max_output_tokens: int = 1024  # generate at most this many tokens
     # if input length + max_output_tokens > context length of model,
     # we will try shortening requested output
     min_output_tokens: int = 64
@@ -68,11 +76,20 @@ class LLMConfig(BaseSettings):
     # use chat model for completion? For OpenAI models, this MUST be set to True!
     use_chat_for_completion: bool = True
     stream: bool = True  # stream output from API?
+    # TODO: we could have a `stream_reasoning` flag here to control whether to show
+    # reasoning output from reasoning models
     cache_config: None | CacheDBConfig = RedisCacheConfig()
+    thought_delimiters: Tuple[str, str] = ("<think>", "</think>")
 
     # Dict of model -> (input/prompt cost, output/completion cost)
     chat_cost_per_1k_tokens: Tuple[float, float] = (0.0, 0.0)
     completion_cost_per_1k_tokens: Tuple[float, float] = (0.0, 0.0)
+
+    @property
+    def model_max_output_tokens(self) -> int:
+        return (
+            self.max_output_tokens or get_model_info(self.chat_model).max_output_tokens
+        )
 
 
 class LLMFunctionCall(BaseModel):
@@ -97,7 +114,17 @@ class LLMFunctionCall(BaseModel):
         # so we try to be safe by removing newlines.
         if fun_args_str is not None:
             fun_args_str = fun_args_str.replace("\n", "").strip()
-            fun_args = ast.literal_eval(fun_args_str)
+            dict_or_list = parse_imperfect_json(fun_args_str)
+
+            if not isinstance(dict_or_list, dict):
+                raise ValueError(
+                    f"""
+                        Invalid function args: {fun_args_str} 
+                        parsed as {dict_or_list},
+                        which is not a valid dict.
+                        """
+                )
+            fun_args = dict_or_list
         else:
             fun_args = None
         fun_call.arguments = fun_args
@@ -156,7 +183,27 @@ class OpenAIToolCall(BaseModel):
 
 class OpenAIToolSpec(BaseModel):
     type: ToolTypes
+    strict: Optional[bool] = None
     function: LLMFunctionSpec
+
+
+class OpenAIJsonSchemaSpec(BaseModel):
+    strict: Optional[bool] = None
+    function: LLMFunctionSpec
+
+    def to_dict(self) -> Dict[str, Any]:
+        json_schema: Dict[str, Any] = {
+            "name": self.function.name,
+            "description": self.function.description,
+            "schema": self.function.parameters,
+        }
+        if self.strict is not None:
+            json_schema["strict"] = self.strict
+
+        return {
+            "type": "json_schema",
+            "json_schema": json_schema,
+        }
 
 
 class LLMTokenUsage(BaseModel):
@@ -280,6 +327,7 @@ class LLMResponse(BaseModel):
     """
 
     message: str
+    reasoning: str = ""  # optional reasoning text from reasoning models
     # TODO tool_id needs to generalize to multi-tool calls
     tool_id: str = ""  # used by OpenAIAssistant
     oai_tool_calls: Optional[List[OpenAIToolCall]] = None
@@ -512,6 +560,7 @@ class LanguageModel(ABC):
         tool_choice: ToolChoiceTypes | Dict[str, str | Dict[str, str]] = "auto",
         functions: Optional[List[LLMFunctionSpec]] = None,
         function_call: str | Dict[str, str] = "auto",
+        response_format: Optional[OpenAIJsonSchemaSpec] = None,
     ) -> LLMResponse:
         """
         Get chat-completion response from LLM.
@@ -538,6 +587,7 @@ class LanguageModel(ABC):
         tool_choice: ToolChoiceTypes | Dict[str, str | Dict[str, str]] = "auto",
         functions: Optional[List[LLMFunctionSpec]] = None,
         function_call: str | Dict[str, str] = "auto",
+        response_format: Optional[OpenAIJsonSchemaSpec] = None,
     ) -> LLMResponse:
         """Async version of `chat`. See `chat` for details."""
         pass
@@ -603,6 +653,26 @@ class LanguageModel(ABC):
             total_tokens += counter.total_tokens
             total_cost += counter.cost
         return total_tokens, total_cost
+
+    def get_reasoning_final(self, message: str) -> Tuple[str, str]:
+        """Extract "reasoning" and "final answer" from an LLM response, if the
+        reasoning is found within configured delimiters, like <think>, </think>.
+        E.g.,
+        '<think> Okay, let's see, the user wants... </think> 2 + 3 = 5'
+
+        Args:
+            message (str): message from LLM
+
+        Returns:
+            Tuple[str, str]: reasoning, final answer
+        """
+        start, end = self.config.thought_delimiters
+        if start in message and end in message:
+            parts = message.split(start)
+            if len(parts) > 1:
+                reasoning, final = parts[1].split(end)
+                return reasoning, final
+        return "", message
 
     def followup_to_standalone(
         self, chat_history: List[Tuple[str, str]], question: str
